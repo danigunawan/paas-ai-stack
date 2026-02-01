@@ -1,0 +1,147 @@
+---
+# Configure Coolify Proxy (Traefik) for Cloudflare Tunnel
+
+- name: Wait for Coolify proxy config
+  ansible.builtin.wait_for:
+    path: /data/coolify/proxy/docker-compose.yml
+    timeout: 60
+  register: proxy_config_wait
+  failed_when: false
+
+- name: Configure Coolify proxy
+  when: proxy_config_wait is succeeded
+  block:
+    - name: Backup original proxy config
+      ansible.builtin.copy:
+        src: /data/coolify/proxy/docker-compose.yml
+        dest: /data/coolify/proxy/docker-compose.yml.bak
+        remote_src: true
+        mode: "0644"
+      failed_when: false
+
+    - name: Create modified proxy config
+      ansible.builtin.copy:
+        dest: /data/coolify/proxy/docker-compose.yml
+        mode: "0644"
+        content: |
+          name: coolify-proxy
+          networks:
+            coolify:
+              external: true
+          services:
+            traefik:
+              container_name: coolify-proxy
+              image: 'traefik:v3.6'
+              restart: unless-stopped
+              extra_hosts:
+                - 'host.docker.internal:host-gateway'
+              networks:
+                - coolify
+              # No host ports - accessed via Docker network only (Cloudflare Tunnel)
+              healthcheck:
+                test: 'wget -qO- http://localhost:80/ping || exit 1'
+                interval: 4s
+                timeout: 2s
+                retries: 5
+              volumes:
+                - '/var/run/docker.sock:/var/run/docker.sock:ro'
+                - '/data/coolify/proxy/:/traefik'
+              command:
+                - '--ping=true'
+                - '--ping.entrypoint=http'
+                - '--api.dashboard=true'
+                - '--entrypoints.http.address=:80'
+                - '--entrypoints.https.address=:443'
+                - '--entrypoints.http.http.encodequerysemicolons=true'
+                - '--entryPoints.http.http2.maxConcurrentStreams=250'
+                - '--entrypoints.https.http.encodequerysemicolons=true'
+                - '--entryPoints.https.http2.maxConcurrentStreams=250'
+                - '--entrypoints.https.http3'
+                - '--providers.file.directory=/traefik/dynamic/'
+                - '--providers.file.watch=true'
+                - '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
+                - '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http'
+                - '--certificatesresolvers.letsencrypt.acme.storage=/traefik/acme.json'
+                - '--api.insecure=false'
+                - '--providers.docker=true'
+                - '--providers.docker.exposedbydefault=false'
+              labels:
+                - traefik.enable=true
+                - traefik.http.routers.traefik.entrypoints=http
+                - traefik.http.routers.traefik.service=api@internal
+                - traefik.http.services.traefik.loadbalancer.server.port=8080
+                - coolify.managed=true
+                - coolify.proxy=true
+
+    - name: Remove existing proxy container
+      community.docker.docker_container:
+        name: coolify-proxy
+        state: absent
+      failed_when: false
+
+    - name: Start Coolify proxy
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: /data/coolify/proxy
+      changed_when: true
+
+    - name: Wait for proxy health
+      community.docker.docker_container_info:
+        name: coolify-proxy
+      register: proxy_info
+      until: proxy_info.container.State.Health.Status == 'healthy'
+      retries: 15
+      delay: 2
+      failed_when: false
+
+    - name: Connect proxy to paas-network
+      ansible.builtin.command: docker network connect paas-network coolify-proxy
+      register: proxy_network
+      changed_when: proxy_network.rc == 0
+      failed_when: false
+
+    - name: Display proxy status
+      ansible.builtin.debug:
+        msg: "{{ 'Coolify proxy configured for Cloudflare Tunnel' if proxy_info.container.State.Health.Status == 'healthy' else 'Proxy may still be starting' }}"
+
+# =============================================================================
+# Connect Core Services to Coolify Network
+# =============================================================================
+# This enables inter-service communication:
+#   - Gitea: Coolify helper clones repos via SSH
+#   - n8n: Workflows can call deployed app APIs
+#   - OpenClaw: AI agent can interact with deployed apps
+#   - LobeChat: Chat can access deployed services
+
+- name: Connect Gitea to coolify network
+  ansible.builtin.command: docker network connect coolify gitea
+  register: gitea_coolify_network
+  changed_when: gitea_coolify_network.rc == 0
+  failed_when: false
+
+- name: Connect n8n to coolify network
+  ansible.builtin.command: docker network connect coolify n8n
+  register: n8n_coolify_network
+  changed_when: n8n_coolify_network.rc == 0
+  failed_when: false
+
+- name: Connect OpenClaw to coolify network
+  ansible.builtin.command: docker network connect coolify openclaw-cli
+  register: openclaw_coolify_network
+  changed_when: openclaw_coolify_network.rc == 0
+  failed_when: false
+
+- name: Connect LobeChat to coolify network
+  ansible.builtin.command: docker network connect coolify lobe-chat
+  register: lobe_coolify_network
+  changed_when: lobe_coolify_network.rc == 0
+  failed_when: false
+
+- name: Display network connection status
+  ansible.builtin.debug:
+    msg: |
+      Network Connections:
+        Gitea → coolify:    {{ '✓' if gitea_coolify_network.rc == 0 else 'already connected or error' }}
+        n8n → coolify:      {{ '✓' if n8n_coolify_network.rc == 0 else 'already connected or error' }}
+        OpenClaw → coolify: {{ '✓' if openclaw_coolify_network.rc == 0 else 'already connected or error' }}
+        LobeChat → coolify: {{ '✓' if lobe_coolify_network.rc == 0 else 'already connected or error' }}

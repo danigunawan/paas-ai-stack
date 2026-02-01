@@ -1,0 +1,4 @@
+---
+# n8n role defaults
+
+n8n_url: "http://127.0.0.1:5678"

@@ -1,0 +1,5 @@
+---
+# Coolify role defaults
+
+coolify_url: "http://127.0.0.1:8080"
+coolify_api_url: "{{ coolify_url }}/api/v1"

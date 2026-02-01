@@ -1,0 +1,120 @@
+---
+# macOS-specific prerequisite tasks
+
+- name: Check for /data directory (Coolify requirement)
+  ansible.builtin.stat:
+    path: /data
+  register: data_dir_check
+
+- name: Check synthetic.conf for /data entry
+  ansible.builtin.command: grep -q "^data" /etc/synthetic.conf
+  register: synthetic_check
+  changed_when: false
+  failed_when: false
+  when: not data_dir_check.stat.exists
+
+- name: Create synthetic firmlink for /data
+  when:
+    - not data_dir_check.stat.exists
+    - synthetic_check.rc != 0
+  block:
+    - name: Create coolify-data directory
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/coolify-data"
+        state: directory
+        mode: "0755"
+
+    - name: Add synthetic.conf entry
+      ansible.builtin.lineinfile:
+        path: /etc/synthetic.conf
+        line: "data\tUsers/{{ ansible_user_id }}/coolify-data"
+        create: true
+        mode: "0644"
+      become: true
+
+    - name: Notify about reboot requirement
+      ansible.builtin.fail:
+        msg: |
+          macOS REBOOT REQUIRED
+          
+          The /data directory requires a synthetic firmlink which
+          only takes effect after a reboot.
+          
+          After reboot, run the Ansible playbook again.
+
+- name: Check for user group matching username
+  ansible.builtin.command: "dscl . -read /Groups/{{ ansible_user_id }}"
+  register: group_check
+  changed_when: false
+  failed_when: false
+
+- name: Create user group if missing
+  when: group_check.rc != 0
+  block:
+    - name: Find next available GID
+      ansible.builtin.shell: |
+        NEXT_GID=1001
+        while dscl . -list /Groups PrimaryGroupID | grep -q "\\b${NEXT_GID}\\b"; do
+          NEXT_GID=$((NEXT_GID + 1))
+        done
+        echo $NEXT_GID
+      register: next_gid
+      changed_when: false
+
+    - name: Create group matching username
+      ansible.builtin.command: |
+        dscl . -create /Groups/{{ ansible_user_id }}
+        dscl . -create /Groups/{{ ansible_user_id }} PrimaryGroupID {{ next_gid.stdout }}
+        dscl . -append /Groups/{{ ansible_user_id }} GroupMembership {{ ansible_user_id }}
+      become: true
+      changed_when: true
+
+- name: Check Docker config for credsStore
+  ansible.builtin.command: grep -q '"credsStore"' "{{ ansible_env.HOME }}/.docker/config.json"
+  register: credsstore_check
+  changed_when: false
+  failed_when: false
+
+- name: Remove credsStore from Docker config
+  when: credsstore_check.rc == 0
+  block:
+    - name: Backup Docker config
+      ansible.builtin.copy:
+        src: "{{ ansible_env.HOME }}/.docker/config.json"
+        dest: "{{ ansible_env.HOME }}/.docker/config.json.backup"
+        remote_src: true
+        mode: "0600"
+
+    - name: Remove credsStore entry
+      ansible.builtin.shell: |
+        jq 'del(.credsStore)' "{{ ansible_env.HOME }}/.docker/config.json" > "{{ ansible_env.HOME }}/.docker/config.json.tmp" && \
+        mv "{{ ansible_env.HOME }}/.docker/config.json.tmp" "{{ ansible_env.HOME }}/.docker/config.json"
+      changed_when: true
+
+- name: Ensure /usr/local/bin in SSH PATH
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    line: 'export PATH="/usr/local/bin:$PATH"'
+    create: true
+    mode: "0644"
+  loop:
+    - "{{ ansible_env.HOME }}/.zshenv"
+    - "{{ ansible_env.HOME }}/.profile"
+
+- name: Check Docker context
+  ansible.builtin.command: docker context show
+  register: docker_context
+  changed_when: false
+  failed_when: false
+
+- name: Switch from desktop-linux to default context
+  ansible.builtin.command: docker context use default
+  when: docker_context.stdout == 'desktop-linux'
+  changed_when: true
+  failed_when: false
+
+- name: Ensure coolify network exists
+  community.docker.docker_network:
+    name: coolify
+    state: present
+  failed_when: false

@@ -1,0 +1,286 @@
+---
+# Coolify role - Setup admin account, server config, and SSH
+
+- name: Coolify setup
+  ansible.builtin.debug:
+    msg: "Setting up Coolify admin account..."
+
+# =============================================================================
+# Wait for Coolify
+# =============================================================================
+
+- name: Wait for Coolify API
+  ansible.builtin.uri:
+    url: "{{ coolify_url }}/api/health"
+    method: GET
+    status_code: [200]
+  register: coolify_ready
+  until: coolify_ready.status == 200
+  retries: 18
+  delay: 5
+  failed_when: false
+
+# =============================================================================
+# Check/Create Admin User
+# =============================================================================
+
+- name: Check existing users
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="echo App\Models\User::count();"
+  register: user_count
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: user_count.rc == 0
+  failed_when: false
+
+- name: Create admin user
+  when: user_count.stdout | trim == '0'
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    \$user = new App\Models\User;
+    \$user->name = '{{ admin_username }}';
+    \$user->email = '{{ admin_email }}';
+    \$user->password = bcrypt('{{ admin_password }}');
+    \$user->save();
+    echo 'created:' . \$user->id;
+    "
+  register: create_user
+  changed_when: "'created:' in create_user.stdout"
+
+- name: Display admin status
+  ansible.builtin.debug:
+    msg: "{{ 'Admin user created' if user_count.stdout | trim == '0' else 'Admin user exists' }}"
+
+# =============================================================================
+# Configure Instance Settings
+# =============================================================================
+
+- name: Configure instance settings
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    \$settings = \App\Models\InstanceSettings::first();
+    if (\$settings) {
+        \$settings->is_api_enabled = true;
+        \$settings->fqdn = 'https://{{ coolify_domain }}';
+        \$settings->is_registration_enabled = false;
+        \$settings->instance_name = 'PaaS AI Stack';
+        \$settings->public_ipv4 = null;
+        \$settings->save();
+        echo 'configured';
+    }
+    "
+  register: settings_result
+  changed_when: "'configured' in settings_result.stdout"
+  retries: 3
+  delay: 3
+  until: settings_result.rc == 0
+  failed_when: false
+
+# =============================================================================
+# Generate API Token
+# =============================================================================
+
+- name: Generate API token (always regenerate for fresh bootstrap)
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use Illuminate\Support\Str;
+    \$user = \App\Models\User::first();
+    \$team = \App\Models\Team::first();
+    if (\$user && \$team) {
+        \App\Models\PersonalAccessToken::truncate();
+        \$plainTextToken = Str::random(40);
+        \$token = new \App\Models\PersonalAccessToken();
+        \$token->name = 'paas-api';
+        \$token->token = hash('sha256', \$plainTextToken);
+        \$token->abilities = ['*'];
+        \$token->tokenable_type = get_class(\$user);
+        \$token->tokenable_id = \$user->id;
+        \$token->team_id = \$team->id;
+        \$token->save();
+        echo \$token->id . '|' . \$plainTextToken;
+    }
+    "
+  register: token_result
+  changed_when: "'|' in token_result.stdout"
+  retries: 3
+  delay: 5
+  until: "'|' in token_result.stdout"
+  failed_when: false
+
+- name: Set Coolify token
+  ansible.builtin.set_fact:
+    coolify_token: "{{ token_result.stdout | trim }}"
+  when: "'|' in token_result.stdout | default('')"
+
+- name: Update .env with Coolify token
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^COOLIFY_TOKEN="
+    line: "COOLIFY_TOKEN={{ coolify_token }}"
+  when: coolify_token | default('') | length > 0
+
+# =============================================================================
+# Setup SSH Key for Server
+# =============================================================================
+
+- name: Generate SSH key for Coolify
+  community.crypto.openssh_keypair:
+    path: "{{ paas_data_dir }}/coolify-ssh/id_ed25519"
+    type: ed25519
+    comment: "coolify@localhost"
+    mode: "0600"
+  register: ssh_key
+
+- name: Read SSH public key
+  ansible.builtin.slurp:
+    src: "{{ paas_data_dir }}/coolify-ssh/id_ed25519.pub"
+  register: ssh_pub_key
+
+- name: Add Coolify key to authorized_keys
+  ansible.posix.authorized_key:
+    user: "{{ ansible_user_id }}"
+    state: present
+    key: "{{ ssh_pub_key.content | b64decode }}"
+    comment: "coolify@localhost"
+
+- name: Test SSH key works (if SSH available)
+  ansible.builtin.command: >
+    ssh -i {{ paas_data_dir }}/coolify-ssh/id_ed25519
+    -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5
+    localhost "echo SSH_TEST_OK"
+  register: ssh_key_test
+  changed_when: false
+  failed_when: false
+
+- name: Display SSH key test result
+  ansible.builtin.debug:
+    msg: "{{ 'SSH key verified - connection test passed' if 'SSH_TEST_OK' in ssh_key_test.stdout else 'SSH key added but connection test failed (may require manual approval on macOS)' }}"
+
+# =============================================================================
+# Configure Server in Coolify
+# =============================================================================
+
+- name: Read SSH private key
+  ansible.builtin.slurp:
+    src: "{{ paas_data_dir }}/coolify-ssh/id_ed25519"
+  register: ssh_priv_key
+
+- name: Configure Coolify server
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use App\Models\PrivateKey;
+    use App\Models\Server;
+    use App\Models\Team;
+
+    \$team = Team::first();
+    \$existingKey = PrivateKey::find(0);
+
+    if (!\$existingKey) {
+        \$key = new PrivateKey();
+        \$key->id = 0;
+        \$key->uuid = (string) \Illuminate\Support\Str::uuid();
+        \$key->name = 'localhost-key';
+        \$key->description = 'SSH key for localhost server';
+        \$key->private_key = base64_decode('{{ ssh_priv_key.content }}');
+        \$key->is_git_related = false;
+        \$key->team_id = \$team->id;
+        \$key->save();
+        echo 'Key created';
+    }
+
+    \$server = Server::find(0);
+    if (\$server) {
+        \$server->user = '{{ ansible_user_id }}';
+        \$server->team_id = \$team->id;
+        \$server->save();
+        echo ' Server updated';
+    }
+    "
+  register: server_config
+  changed_when: "'created' in server_config.stdout or 'updated' in server_config.stdout"
+  failed_when: false
+
+# =============================================================================
+# Write SSH Key to Coolify's SSH Directory
+# =============================================================================
+
+- name: Write SSH key to Coolify container
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use App\Models\PrivateKey;
+    use App\Models\Server;
+
+    \$key = PrivateKey::find(0);
+    \$server = Server::find(0);
+
+    if (\$key && \$server) {
+        @mkdir('/data/coolify/ssh/keys', 0700, true);
+        \$keyPath = '/data/coolify/ssh/keys/id.' . \$server->user . '@' . \$server->ip . '.ed25519';
+        file_put_contents(\$keyPath, \$key->private_key);
+        chmod(\$keyPath, 0600);
+        echo 'Key written to: ' . \$keyPath;
+    }
+    "
+  register: key_write
+  changed_when: "'Key written' in key_write.stdout"
+  failed_when: false
+
+# =============================================================================
+# Configure Wildcard Domain
+# =============================================================================
+
+- name: Configure wildcard domain
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use App\Models\Server;
+    \$server = Server::find(0);
+    if (\$server && \$server->settings) {
+        \$server->settings->wildcard_domain = 'https://{{ base_domain }}';
+        \$server->settings->is_cloudflare_tunnel = false;
+        \$server->settings->save();
+        echo 'Wildcard configured';
+    }
+    "
+  register: wildcard_config
+  changed_when: "'configured' in wildcard_config.stdout"
+  failed_when: false
+
+# =============================================================================
+# Create Docker Destination
+# =============================================================================
+
+- name: Check for Docker destination
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    \$dest = \App\Models\StandaloneDocker::first();
+    echo \$dest ? \$dest->uuid : 'NONE';
+    "
+  register: dest_check
+  changed_when: false
+  failed_when: false
+
+- name: Create Docker destination
+  when: dest_check.stdout | trim == 'NONE'
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use App\Models\StandaloneDocker;
+    use App\Models\Server;
+    use Illuminate\Support\Str;
+    \$server = Server::find(0);
+    if (\$server) {
+        \$dest = new StandaloneDocker();
+        \$dest->uuid = (string) Str::uuid();
+        \$dest->name = 'coolify';
+        \$dest->network = 'coolify';
+        \$dest->server_id = \$server->id;
+        \$dest->save();
+        echo 'Destination created';
+    }
+    "
+  register: dest_create
+  changed_when: "'created' in dest_create.stdout"
+
+- name: Coolify setup complete
+  ansible.builtin.debug:
+    msg: "Coolify admin account and server configured"

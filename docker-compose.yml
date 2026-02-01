@@ -1,0 +1,538 @@
+# PaaS AI Stack - Complete Self-Hosted Platform (Security Hardened)
+# Cross-platform: Windows, Mac, Linux (Docker Desktop or Docker Engine)
+# Accessible via Cloudflare Tunnel - all ports bound to localhost only
+
+networks:
+  paas-network:
+    driver: bridge
+    name: paas-network
+
+volumes:
+  lobe-postgres-data:
+  lobe-minio-data:
+
+services:
+  # =============================================================================
+  # CORE INFRASTRUCTURE
+  # =============================================================================
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    healthcheck:
+      test: ["CMD", "cloudflared", "version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # ARCHIVE - Source of Truth (Gitea)
+  # =============================================================================
+
+  postgres-git:
+    image: postgres:16-alpine
+    container_name: postgres-git
+    restart: unless-stopped
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_GIT_USER:-gitea}
+      POSTGRES_PASSWORD: ${POSTGRES_GIT_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_GIT_DB:-gitea}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgres-git:/var/lib/postgresql/data
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_GIT_USER:-gitea}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: unless-stopped
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      # Database
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=postgres-git:5432
+      - GITEA__database__NAME=${POSTGRES_GIT_DB:-gitea}
+      - GITEA__database__USER=${POSTGRES_GIT_USER:-gitea}
+      - GITEA__database__PASSWD=${POSTGRES_GIT_PASSWORD}
+      # Server
+      - GITEA__server__DOMAIN=${GITEA_DOMAIN}
+      - GITEA__server__ROOT_URL=https://${GITEA_DOMAIN}
+      - GITEA__server__SSH_DOMAIN=${GITEA_DOMAIN}
+      - GITEA__server__SSH_PORT=2222
+      - GITEA__server__LFS_START_SERVER=true
+      # Features
+      - GITEA__actions__ENABLED=true
+      # Security: Set to true after initial setup (bootstrap does this automatically)
+      - GITEA__service__DISABLE_REGISTRATION=${GITEA_DISABLE_REGISTRATION:-false}
+      - GITEA__service__REQUIRE_SIGNIN_VIEW=${GITEA_REQUIRE_SIGNIN:-false}
+      # Auto-install (skips web wizard on first run)
+      - GITEA__security__INSTALL_LOCK=true
+    volumes:
+      - ./data/gitea:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:2222:2222"
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres-git:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Gitea Actions Runner - Uses rootless Docker-in-Docker for security
+  # This provides isolation: jobs run in their own Docker daemon, not the host's
+  gitea-actions:
+    image: gitea/act_runner:latest-dind-rootless
+    container_name: gitea-actions
+    restart: unless-stopped
+    environment:
+      - GITEA_INSTANCE_URL=https://${GITEA_DOMAIN}
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${GITEA_ACTIONS_TOKEN:-}
+      - GITEA_RUNNER_NAME=local-runner
+      # Labels format: label:mode where mode is 'host' or 'docker://image'
+      # self-hosted:host = runs directly on runner (has docker, curl, git)
+      # linux:docker://ubuntu:22.04 = runs in ubuntu container with all tools
+      - GITEA_RUNNER_LABELS=self-hosted:host,linux:docker://ubuntu:22.04
+      # Rootless DinD settings
+      - DOCKER_HOST=unix:///run/user/1000/docker.sock
+    volumes:
+      - ./data/gitea-actions:/data
+      # Note: No host docker.sock mount - uses internal rootless Docker
+    networks:
+      - paas-network
+    depends_on:
+      - gitea
+    # Required: Rootless DinD needs privileged for inner Docker daemon
+    # But jobs are isolated from host Docker - much safer than host socket
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+
+  # =============================================================================
+  # LAUNCHBAY - Deploy & Activate (Coolify)
+  # =============================================================================
+
+  coolify-redis:
+    image: redis:7-alpine
+    container_name: coolify-redis
+    restart: unless-stopped
+    user: redis
+    volumes:
+      - ./data/coolify-redis:/data
+    networks:
+      - paas-network
+    command: redis-server --appendonly yes
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coolify-db:
+    image: postgres:16-alpine
+    container_name: coolify-db
+    restart: unless-stopped
+    user: postgres
+    environment:
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: ${POSTGRES_COOLIFY_PASSWORD}
+      POSTGRES_DB: coolify
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/coolify-db:/var/lib/postgresql/data
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  coolify-realtime:
+    image: quay.io/soketi/soketi:1.6-16-alpine
+    container_name: coolify-realtime
+    restart: unless-stopped
+    environment:
+      - SOKETI_DEBUG=false
+      - SOKETI_DEFAULT_APP_ID=coolify
+      - SOKETI_DEFAULT_APP_KEY=coolify
+      - SOKETI_DEFAULT_APP_SECRET=coolify
+    ports:
+      - "127.0.0.1:6001:6001"
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:6001', (r) => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Coolify - Self-hosted deployment platform
+  # Security Note: Coolify requires Docker socket access and privileged mode
+  # for local deployments. This is a documented requirement from Coolify.
+  # Docker socket is mounted read-only where possible.
+  coolify:
+    image: ghcr.io/coollabsio/coolify:latest
+    container_name: coolify
+    restart: unless-stopped
+    environment:
+      - COOLIFY_DOMAIN=${COOLIFY_DOMAIN}
+      - COOLIFY_AUTO_UPDATE=false
+      - DB_CONNECTION=pgsql
+      - DB_HOST=coolify-db
+      - DB_PORT=5432
+      - DB_DATABASE=coolify
+      - DB_USERNAME=coolify
+      - DB_PASSWORD=${POSTGRES_COOLIFY_PASSWORD}
+      - REDIS_HOST=coolify-redis
+      - REDIS_PORT=6379
+      - APP_KEY=${COOLIFY_APP_KEY}
+      - PUSHER_APP_ID=coolify
+      - PUSHER_APP_KEY=coolify
+      - PUSHER_APP_SECRET=coolify
+      - PUSHER_HOST=${COOLIFY_REALTIME_DOMAIN}
+      - PUSHER_PORT=443
+      - PUSHER_SCHEME=https
+      - BROADCAST_DRIVER=pusher
+      - TRUST_PROXIES=*
+      - FORCE_HTTPS=false
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data/coolify:/data/coolify
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - paas-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Required: Deployment platform needs docker access
+    privileged: true
+    depends_on:
+      coolify-redis:
+        condition: service_healthy
+      coolify-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # AUTOMATA - Workflows & Triggers (n8n)
+  # =============================================================================
+
+  postgres-n8n:
+    image: postgres:16-alpine
+    container_name: postgres-n8n
+    restart: unless-stopped
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_N8N_USER:-n8n}
+      POSTGRES_PASSWORD: ${POSTGRES_N8N_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_N8N_DB:-n8n}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgres-n8n:/var/lib/postgresql/data
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_N8N_USER:-n8n}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    user: node
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres-n8n
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_N8N_DB:-n8n}
+      - DB_POSTGRESDB_USER=${POSTGRES_N8N_USER:-n8n}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_N8N_PASSWORD}
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${N8N_DOMAIN}/
+      - GENERIC_TIMEZONE=${TIMEZONE:-America/New_York}
+      - TZ=${TIMEZONE:-America/New_York}
+      # Auto-create owner account on first run
+      - N8N_DEFAULT_USER_EMAIL=${ADMIN_EMAIL:-}
+      - N8N_DEFAULT_USER_PASSWORD=${ADMIN_PASSWORD:-}
+    volumes:
+      - ./data/n8n:/home/node/.n8n
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "127.0.0.1:5678:5678"
+    networks:
+      - paas-network
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres-n8n:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # LOBE - AI Chat Interface (LobeChat + Casdoor + MinIO)
+  # =============================================================================
+
+  lobe-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lobe-postgres
+    restart: unless-stopped
+    user: postgres
+    networks:
+      - paas-network
+    volumes:
+      - lobe-postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${LOBE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LOBE_DB_NAME:-lobechat}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  lobe-minio:
+    image: minio/minio
+    container_name: lobe-minio
+    restart: unless-stopped
+    networks:
+      - paas-network
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - lobe-minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_API_CORS_ALLOW_ORIGIN: https://${LOBE_DOMAIN}
+    command: server /data --console-address ":9001"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  lobe-minio-init:
+    image: minio/mc
+    container_name: lobe-minio-init
+    networks:
+      - paas-network
+    depends_on:
+      lobe-minio:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: >
+      /bin/sh -c "
+      echo '=== MinIO Init Job ===';
+      mc alias set lobe http://lobe-minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      if ! mc ls lobe/$${MINIO_LOBE_BUCKET} > /dev/null 2>&1; then
+        echo 'Creating bucket: '$${MINIO_LOBE_BUCKET};
+        mc mb lobe/$${MINIO_LOBE_BUCKET};
+      else
+        echo 'Bucket already exists: '$${MINIO_LOBE_BUCKET};
+      fi;
+      echo 'Setting download policy...';
+      mc anonymous set download lobe/$${MINIO_LOBE_BUCKET};
+      echo '=== MinIO Init Complete ===';
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_LOBE_BUCKET: ${MINIO_LOBE_BUCKET:-lobechat}
+
+  lobe-casdoor:
+    image: casbin/casdoor
+    container_name: lobe-casdoor
+    restart: unless-stopped
+    networks:
+      - paas-network
+    ports:
+      - "127.0.0.1:8000:8000"
+    entrypoint: /bin/sh -c './server --createDatabase=true'
+    depends_on:
+      lobe-postgres:
+        condition: service_healthy
+    environment:
+      RUNNING_IN_DOCKER: "true"
+      driverName: "postgres"
+      dataSourceName: "user=postgres password=${LOBE_POSTGRES_PASSWORD} host=lobe-postgres port=5432 sslmode=disable dbname=casdoor"
+      origin: "https://${CASDOOR_DOMAIN}"
+      runmode: "prod"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  lobe-chat:
+    image: lobehub/lobehub
+    container_name: lobe-chat
+    restart: unless-stopped
+    networks:
+      - paas-network
+    ports:
+      - "127.0.0.1:3210:3210"
+    depends_on:
+      lobe-postgres:
+        condition: service_healthy
+      lobe-minio-init:
+        condition: service_completed_successfully
+      lobe-casdoor:
+        condition: service_healthy
+    environment:
+      APP_URL: https://${LOBE_DOMAIN}
+      KEY_VAULTS_SECRET: ${KEY_VAULTS_SECRET}
+      AUTH_SECRET: ${NEXT_AUTH_SECRET}
+      JWKS_KEY: ${JWKS_KEY}
+      AUTH_SSO_PROVIDERS: casdoor
+      AUTH_CASDOOR_ISSUER: https://${CASDOOR_DOMAIN}
+      AUTH_CASDOOR_ID: ${CASDOOR_CLIENT_ID}
+      AUTH_CASDOOR_SECRET: ${CASDOOR_CLIENT_SECRET}
+      DATABASE_URL: postgresql://postgres:${LOBE_POSTGRES_PASSWORD}@lobe-postgres:5432/${LOBE_DB_NAME:-lobechat}
+      S3_ENDPOINT: https://${MINIO_DOMAIN}
+      S3_BUCKET: ${MINIO_LOBE_BUCKET:-lobechat}
+      S3_PUBLIC_DOMAIN: https://${MINIO_DOMAIN}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_ENABLE_PATH_STYLE: 1
+      LLM_VISION_IMAGE_USE_BASE64: 1
+      # AI Provider - OpenRouter (unified gateway to multiple providers)
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Additional providers (direct access)
+      GOOGLE_API_KEY: ${GEMINI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}
+      # Embeddings via Cloudflare (keep for RAG)
+      OPENAI_API_KEY: ${CLOUDFLARE_API_TOKEN:-}
+      OPENAI_PROXY_URL: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1
+      DEFAULT_FILES_CONFIG: embedding_model=openai/@cf/baai/bge-large-en-v1.5
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3210/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # =============================================================================
+  # AI GATEWAY - OpenClaw (requires docker + SSH access)
+  # =============================================================================
+
+  openclaw-cli:
+    build:
+      context: ./openclaw-cli
+      dockerfile: Dockerfile
+      args:
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-main}
+    container_name: openclaw-cli
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:18789:18789"
+    volumes:
+      - ./data/openclaw:/root/.openclaw
+      - ./data/openclaw-workspace:/root/openclaw-workspace
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./scripts:/srv/paas/scripts:ro
+      - ./skills:/srv/paas/skills:ro
+      # Uncomment ONLY if you need OpenClaw sandbox feature (run tools in Docker)
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - paas-network
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - TZ=${TIMEZONE:-America/New_York}
+      - HOME=/root
+      - TERM=xterm-256color
+      - NODE_ENV=production
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
+      # AI API Keys (priority: Anthropic > OpenRouter > OpenAI > Gemini)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
+      - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
+      - GITEA_TOKEN=${GITEA_TOKEN:-}
+      - COOLIFY_TOKEN=${COOLIFY_TOKEN:-}
+      - N8N_TOKEN=${N8N_TOKEN:-}
+      # Telegram (required for Telegram channel)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      # Optional features
+      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      # Service URLs (for skills)
+      - GITEA_URL=https://${GITEA_DOMAIN}
+      - COOLIFY_URL=https://${COOLIFY_DOMAIN}
+      - N8N_URL=https://${N8N_DOMAIN}
+      - LOBE_URL=https://${LOBE_DOMAIN}
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789", "--allow-unconfigured"]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:18789/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

@@ -1,0 +1,9 @@
+---
+# Prerequisites handlers
+
+- name: Restart Docker
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+  become: true
+  when: ansible_os_family != 'Darwin'

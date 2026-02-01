@@ -1,0 +1,25 @@
+---
+# Cloudflare role defaults
+
+cloudflare_api_base: "https://api.cloudflare.com/client/v4"
+
+# Service routes for tunnel
+tunnel_routes:
+  - hostname: "{{ gitea_domain }}"
+    service: "http://gitea:3000"
+  - hostname: "{{ coolify_domain }}"
+    service: "http://coolify:8080"
+  - hostname: "{{ coolify_realtime_domain }}"
+    service: "http://coolify-realtime:6001"
+  - hostname: "{{ n8n_domain }}"
+    service: "http://n8n:5678"
+  - hostname: "{{ lobe_domain }}"
+    service: "http://lobe-chat:3210"
+  - hostname: "{{ casdoor_domain }}"
+    service: "http://lobe-casdoor:8000"
+  - hostname: "{{ minio_domain }}"
+    service: "http://lobe-minio:9000"
+  - hostname: "{{ openclaw_domain }}"
+    service: "http://openclaw-cli:18789"
+  - hostname: "*.{{ base_domain }}"
+    service: "http://coolify-proxy:80"

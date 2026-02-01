@@ -1,0 +1,315 @@
+---
+# Integration role - Setup Gitea Actions runner and CI/CD integration
+
+- name: Integration setup
+  ansible.builtin.debug:
+    msg: "Setting up CI/CD integration..."
+
+# =============================================================================
+# Configure Coolify Proxy (Traefik)
+# =============================================================================
+
+- name: Configure Coolify proxy
+  ansible.builtin.include_tasks: coolify_proxy.yml
+
+# =============================================================================
+# Gitea Actions Runner
+# =============================================================================
+
+- name: Generate Gitea Actions runner token
+  ansible.builtin.command: >
+    docker exec -u git gitea gitea actions generate-runner-token --config /data/gitea/conf/app.ini
+  register: runner_token
+  changed_when: false
+  failed_when: false
+
+- name: Set runner token
+  ansible.builtin.set_fact:
+    gitea_actions_token: "{{ runner_token.stdout | trim }}"
+  when: runner_token.stdout | trim | length > 0
+
+- name: Update .env with runner token
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^GITEA_ACTIONS_TOKEN="
+    line: "GITEA_ACTIONS_TOKEN={{ gitea_actions_token }}"
+  when: gitea_actions_token | default('') | length > 0
+
+- name: Clear runner state for fresh registration
+  ansible.builtin.file:
+    path: "{{ paas_data_dir }}/gitea-actions/.runner"
+    state: absent
+  when: runner_token.stdout | trim | length > 0
+
+- name: Restart Gitea Actions runner
+  ansible.builtin.command: >
+    docker compose {{ compose_files }} --env-file .env up -d gitea-actions --force-recreate
+  args:
+    chdir: "{{ paas_root }}"
+  environment:
+    GITEA_ACTIONS_TOKEN: "{{ gitea_actions_token }}"
+  changed_when: true
+  when: gitea_actions_token | default('') | length > 0
+
+- name: Wait for runner registration
+  ansible.builtin.pause:
+    seconds: 8
+
+- name: Check runner registration
+  ansible.builtin.command: docker logs gitea-actions
+  register: runner_logs
+  changed_when: false
+  failed_when: false
+
+- name: Display runner status
+  ansible.builtin.debug:
+    msg: "{{ 'Runner registered successfully' if 'registered successfully' in runner_logs.stdout else 'Runner registration pending' }}"
+
+# =============================================================================
+# Gitea OAuth for Coolify
+# =============================================================================
+
+- name: Create Gitea OAuth app for Coolify
+  ansible.builtin.uri:
+    url: "{{ gitea_url }}/api/v1/user/applications/oauth2"
+    method: POST
+    user: "{{ admin_username }}"
+    password: "{{ admin_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "Coolify"
+      redirect_uris:
+        - "https://{{ coolify_domain }}/webhooks/source/github/redirect"
+    status_code: [201, 422]  # 422 = already exists
+  register: oauth_create
+  failed_when: false
+
+- name: Save Gitea OAuth credentials
+  when: oauth_create.status == 201 and oauth_create.json.client_id is defined
+  block:
+    - name: Set Gitea OAuth facts
+      ansible.builtin.set_fact:
+        gitea_oauth_client_id: "{{ oauth_create.json.client_id }}"
+        gitea_oauth_client_secret: "{{ oauth_create.json.client_secret }}"
+
+    - name: Update .env with Gitea OAuth client ID
+      ansible.builtin.lineinfile:
+        path: "{{ paas_env_file }}"
+        regexp: "^GITEA_OAUTH_CLIENT_ID="
+        line: "GITEA_OAUTH_CLIENT_ID={{ gitea_oauth_client_id }}"
+
+    - name: Update .env with Gitea OAuth client secret
+      ansible.builtin.lineinfile:
+        path: "{{ paas_env_file }}"
+        regexp: "^GITEA_OAUTH_CLIENT_SECRET="
+        line: "GITEA_OAUTH_CLIENT_SECRET={{ gitea_oauth_client_secret }}"
+
+- name: Display OAuth status
+  ansible.builtin.debug:
+    msg: "{{ 'Gitea OAuth app created for Coolify' if oauth_create.status == 201 else 'Gitea OAuth app already exists' }}"
+
+# =============================================================================
+# Security Hardening
+# =============================================================================
+
+- name: Disable Gitea public registration
+  ansible.builtin.command: >
+    docker exec gitea sed -i 's/DISABLE_REGISTRATION\s*=\s*false/DISABLE_REGISTRATION = true/' /data/gitea/conf/app.ini
+  changed_when: true
+  failed_when: false
+
+- name: Require sign-in to view Gitea
+  ansible.builtin.command: >
+    docker exec gitea sed -i 's/REQUIRE_SIGNIN_VIEW\s*=\s*false/REQUIRE_SIGNIN_VIEW = true/' /data/gitea/conf/app.ini
+  changed_when: true
+  failed_when: false
+
+- name: Restart Gitea to apply config
+  ansible.builtin.command: docker restart gitea
+  changed_when: true
+
+# =============================================================================
+# Verify Security Settings
+# =============================================================================
+
+- name: Check for exposed ports
+  ansible.builtin.shell: |
+    docker compose ps --format json 2>/dev/null | jq -r '.[].Publishers[]? | select(.PublishedPort != null) | "\(.IP):\(.PublishedPort)"' 2>/dev/null | grep -v "127.0.0.1" | grep -v "^:" | head -5 || echo ""
+  args:
+    chdir: "{{ paas_root }}"
+  register: exposed_ports
+  changed_when: false
+  failed_when: false
+
+- name: Warn about exposed ports
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Ports exposed to all interfaces:
+      {{ exposed_ports.stdout }}
+      Consider binding to 127.0.0.1 only
+  when: exposed_ports.stdout | trim | length > 0
+
+- name: Check admin password strength
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Admin password is weak (less than 12 characters).
+      Generate a stronger one: openssl rand -base64 16
+  when: admin_password | length < 12
+
+# =============================================================================
+# Final Service Restart
+# =============================================================================
+
+- name: Flush pending writes to disk
+  ansible.builtin.command: sync
+  changed_when: false
+
+- name: Wait for Gitea restart
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Force complete LobeChat recreate before final restart
+  block:
+    - name: Stop LobeChat
+      ansible.builtin.command: docker stop lobe-chat
+      failed_when: false
+
+    - name: Remove LobeChat container
+      ansible.builtin.command: docker rm -f lobe-chat
+      failed_when: false
+
+- name: Restart all services with final config
+  ansible.builtin.command: >
+    docker compose {{ compose_files }} --env-file .env up -d --force-recreate --quiet-pull
+  args:
+    chdir: "{{ paas_root }}"
+  environment:
+    CASDOOR_CLIENT_ID: "{{ casdoor_client_id | default('') }}"
+    CASDOOR_CLIENT_SECRET: "{{ casdoor_client_secret | default('') }}"
+  changed_when: true
+
+- name: Wait for services to stabilize
+  ansible.builtin.pause:
+    seconds: 10
+
+# =============================================================================
+# Final LobeChat Credential Verification
+# =============================================================================
+
+- name: Verify LobeChat credentials after restart
+  ansible.builtin.command: docker exec lobe-chat printenv AUTH_CASDOOR_ID
+  register: final_lobechat_creds
+  changed_when: false
+  failed_when: false
+
+- name: Fix LobeChat credentials if mismatched
+  when: final_lobechat_creds.stdout | trim != casdoor_client_id | default('')
+  block:
+    - name: Warning - credentials mismatch
+      ansible.builtin.debug:
+        msg: "LobeChat credentials mismatch detected, attempting fix..."
+
+    - name: Force LobeChat recreate
+      ansible.builtin.command: docker rm -f lobe-chat
+      failed_when: false
+
+    - name: Recreate LobeChat with explicit env
+      ansible.builtin.command: >
+        docker compose {{ compose_files }} --env-file .env up -d lobe-chat --force-recreate
+      args:
+        chdir: "{{ paas_root }}"
+      environment:
+        CASDOOR_CLIENT_ID: "{{ casdoor_client_id }}"
+        CASDOOR_CLIENT_SECRET: "{{ casdoor_client_secret }}"
+
+    - name: Wait for LobeChat restart
+      ansible.builtin.pause:
+        seconds: 8
+
+    - name: Re-verify credentials
+      ansible.builtin.command: docker exec lobe-chat printenv AUTH_CASDOOR_ID
+      register: retry_lobechat_creds
+      changed_when: false
+      failed_when: false
+
+    - name: Display credential fix result
+      ansible.builtin.debug:
+        msg: "{{ 'LobeChat credentials fixed' if retry_lobechat_creds.stdout | trim == casdoor_client_id else 'CRITICAL: LobeChat credentials still mismatched - manual fix needed' }}"
+
+# =============================================================================
+# Final Service Health Check
+# =============================================================================
+
+- name: Check final service health
+  community.docker.docker_container_info:
+    name: "{{ item }}"
+  loop:
+    - gitea
+    - coolify
+    - n8n
+    - lobe-chat
+    - openclaw-cli
+  register: final_health_checks
+  failed_when: false
+
+- name: Display final health status
+  ansible.builtin.debug:
+    msg: |
+      Final Service Health:
+      {% for result in final_health_checks.results %}
+        {{ '✓' if result.container.State.Health.Status | default('unknown') == 'healthy' else '⚠' }} {{ result.item }}: {{ result.container.State.Health.Status | default('unknown') }}
+      {% endfor %}
+
+# =============================================================================
+# Validate Server (Coolify)
+# =============================================================================
+
+- name: Test SSH from Coolify to host
+  ansible.builtin.command: >
+    docker exec coolify ssh -i /data/coolify/ssh/keys/id.{{ ansible_user_id }}@host.docker.internal.ed25519
+    -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10
+    {{ ansible_user_id }}@host.docker.internal "echo SSH_OK"
+  register: ssh_test
+  changed_when: false
+  failed_when: false
+
+- name: Mark server as validated
+  when: "'SSH_OK' in ssh_test.stdout"
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    use App\Models\Server;
+    \$server = Server::find(0);
+    if (\$server && \$server->settings) {
+        \$server->settings->is_reachable = true;
+        \$server->settings->is_usable = true;
+        \$server->settings->save();
+        echo 'VALIDATED';
+    }
+    "
+  register: validate_result
+  changed_when: "'VALIDATED' in validate_result.stdout"
+  failed_when: false
+
+- name: Set server validation status
+  ansible.builtin.set_fact:
+    coolify_server_validated: "{{ 'SSH_OK' in ssh_test.stdout }}"
+
+- name: Display server validation status
+  ansible.builtin.debug:
+    msg: |
+      {{ 'Coolify server validated and ready for deployments' if coolify_server_validated else 
+         'SSH test failed - manual validation may be required at https://' ~ coolify_domain ~ '/servers' }}
+
+# =============================================================================
+# Verify All APIs
+# =============================================================================
+
+- name: Verify API access
+  ansible.builtin.include_tasks: verify_apis.yml
+
+- name: Integration setup complete
+  ansible.builtin.debug:
+    msg: "CI/CD integration configured"

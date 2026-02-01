@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# PaaS AI Stack - Update Playbook
+# =============================================================================
+# Updates all services to latest versions.
+# Equivalent to: make update
+#
+# Usage:
+#   ansible-playbook -i inventory/localhost.yml update.yml
+#   ansible-playbook -i inventory/localhost.yml update.yml --tags=backup
+#   ansible-playbook -i inventory/localhost.yml update.yml --tags=images
+#   ansible-playbook -i inventory/localhost.yml update.yml --skip-tags=backup
+# =============================================================================
+
+- name: PaaS AI Stack - Update Services
+  hosts: all
+  gather_facts: true
+
+  vars_files:
+    - inventory/group_vars/all.yml
+
+  tasks:
+    # =========================================================================
+    # Backup
+    # =========================================================================
+    - name: Create backup before update
+      tags: [backup]
+      block:
+        - name: Create backups directory
+          ansible.builtin.file:
+            path: "{{ paas_root }}/backups"
+            state: directory
+            mode: "0755"
+
+        - name: Create backup filename
+          ansible.builtin.set_fact:
+            backup_filename: "backup-{{ ansible_date_time.date | replace('-', '') }}_{{ ansible_date_time.time | replace(':', '') }}.tar.gz"
+
+        - name: Create backup of data directory
+          ansible.builtin.archive:
+            path: "{{ paas_data_dir }}"
+            dest: "{{ paas_root }}/backups/{{ backup_filename }}"
+            format: gz
+          register: backup_result
+
+        - name: Display backup status
+          ansible.builtin.debug:
+            msg: "Backup created: backups/{{ backup_filename }}"
+
+    # =========================================================================
+    # Check for updates
+    # =========================================================================
+    - name: Check for available updates
+      tags: [check]
+      block:
+        - name: Get current image digests
+          ansible.builtin.command: >
+            docker images --format "{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }} {{ '{{' }}.Digest{{ '}}' }}" 
+            --filter "reference=gitea/gitea"
+            --filter "reference=ghcr.io/coollabsio/coolify"
+            --filter "reference=n8nio/n8n"
+            --filter "reference=lobehub/lobe-chat"
+          register: current_images
+          changed_when: false
+
+        - name: Display current versions
+          ansible.builtin.debug:
+            msg: |
+              Current images:
+              {{ current_images.stdout }}
+
+    # =========================================================================
+    # Pull latest images
+    # =========================================================================
+    - name: Update Docker images
+      tags: [images, pull]
+      block:
+        - name: Pull latest images
+          ansible.builtin.command: docker compose {{ compose_files }} --env-file .env pull
+          args:
+            chdir: "{{ paas_root }}"
+          register: pull_result
+          changed_when: "'Downloaded' in pull_result.stdout or 'Pulled' in pull_result.stderr"
+
+        - name: Display pull status
+          ansible.builtin.debug:
+            msg: "Docker images updated"
+
+    # =========================================================================
+    # Rebuild OpenClaw
+    # =========================================================================
+    - name: Rebuild OpenClaw from source
+      tags: [openclaw]
+      block:
+        - name: Build OpenClaw image
+          ansible.builtin.command: docker compose {{ compose_files }} --env-file .env build openclaw-cli --no-cache
+          args:
+            chdir: "{{ paas_root }}"
+          register: build_result
+          changed_when: build_result.rc == 0
+
+        - name: Display build status
+          ansible.builtin.debug:
+            msg: "OpenClaw rebuilt from source (version: {{ openclaw_version | default('main') }})"
+
+    # =========================================================================
+    # Restart services
+    # =========================================================================
+    - name: Restart all services
+      tags: [restart]
+      block:
+        - name: Recreate containers with new images
+          ansible.builtin.command: docker compose {{ compose_files }} --env-file .env up -d --force-recreate
+          args:
+            chdir: "{{ paas_root }}"
+          changed_when: true
+
+        - name: Wait for services to stabilize
+          ansible.builtin.pause:
+            seconds: 15
+
+    # =========================================================================
+    # Health check
+    # =========================================================================
+    - name: Verify service health
+      tags: [verify]
+      block:
+        - name: Check service health
+          community.docker.docker_container_info:
+            name: "{{ item }}"
+          loop:
+            - gitea
+            - coolify
+            - n8n
+            - lobe-chat
+            - openclaw-cli
+          register: health_checks
+          failed_when: false
+
+        - name: Display health status
+          ansible.builtin.debug:
+            msg: |
+              Service Health After Update:
+              {% for result in health_checks.results %}
+                {{ '✓' if result.container.State.Health.Status | default('unknown') == 'healthy' else '⚠' }} {{ result.item }}: {{ result.container.State.Health.Status | default('unknown') }}
+              {% endfor %}
+
+    # =========================================================================
+    # Update version tracking
+    # =========================================================================
+    - name: Update version tracking
+      tags: [versions]
+      block:
+        - name: Get new image versions
+          ansible.builtin.shell: |
+            echo "Updated: {{ ansible_date_time.iso8601 }}"
+            docker images --format "{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}" \
+              gitea/gitea:latest \
+              ghcr.io/coollabsio/coolify:latest \
+              n8nio/n8n:latest \
+              lobehub/lobe-chat:latest 2>/dev/null || true
+          register: version_info
+          changed_when: false
+
+        - name: Write version file
+          ansible.builtin.copy:
+            content: "{{ version_info.stdout }}"
+            dest: "{{ paas_data_dir }}/.versions"
+            mode: "0644"
+
+        - name: Display update complete
+          ansible.builtin.debug:
+            msg: |
+              ═══════════════════════════════════════════════════════════════════
+                                  Update Complete
+              ═══════════════════════════════════════════════════════════════════
+              
+              Backup: backups/{{ backup_filename | default('skipped') }}
+              
+              To rollback if issues occur:
+                ansible-playbook -i inventory/localhost.yml update.yml --tags=rollback \
+                  -e rollback_file=backups/{{ backup_filename | default('backup.tar.gz') }}
+              
+              ═══════════════════════════════════════════════════════════════════

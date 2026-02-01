@@ -1,0 +1,90 @@
+---
+# =============================================================================
+# PaaS AI Stack - Main Playbook
+# =============================================================================
+# Run existing services (assumes initial bootstrap already completed)
+#
+# Usage:
+#   ansible-playbook -i inventory/localhost.yml site.yml
+#   ansible-playbook -i inventory/localhost.yml site.yml --tags=deploy
+#
+# Tags:
+#   prerequisites - Check system requirements
+#   deploy        - Start/restart Docker services
+#   services      - Configure service accounts
+#   integration   - Setup CI/CD integration
+# =============================================================================
+
+- name: PaaS AI Stack
+  hosts: all
+  gather_facts: true
+
+  vars_files:
+    - inventory/group_vars/all.yml
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - base_domain | length > 0
+          - admin_email | length > 0
+          - admin_password | length > 0
+        fail_msg: |
+          Missing required variables. Set these in your inventory:
+            - base_domain
+            - admin_email
+            - admin_password
+      tags: always
+
+  roles:
+    - role: prerequisites
+      tags: [prerequisites, always]
+
+    - role: deploy
+      tags: [deploy]
+
+    - role: gitea
+      tags: [services, gitea]
+
+    - role: coolify
+      tags: [services, coolify]
+
+    - role: n8n
+      tags: [services, n8n]
+
+    - role: lobechat
+      tags: [services, lobechat]
+
+    - role: openclaw
+      tags: [services, openclaw]
+
+    - role: integration
+      tags: [integration]
+
+  post_tasks:
+    - name: Display access information
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════════
+                              PaaS AI Stack Ready
+          ═══════════════════════════════════════════════════════════════════
+
+          SERVICES:
+            Gitea:     https://{{ gitea_domain }}
+            Coolify:   https://{{ coolify_domain }}
+            n8n:       https://{{ n8n_domain }}
+            LobeChat:  https://{{ lobe_domain }}
+            OpenClaw:  https://{{ openclaw_domain }}
+
+          LOGIN:
+            Username:  {{ admin_username }}
+            Email:     {{ admin_email }}
+            Password:  (configured in inventory)
+
+          COMMANDS:
+            make status   - Check service health
+            make logs     - View logs
+            make backup   - Backup data
+
+          ═══════════════════════════════════════════════════════════════════
+      tags: always

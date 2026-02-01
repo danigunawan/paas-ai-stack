@@ -1,0 +1,134 @@
+---
+# Gitea role - Setup admin account and API token
+
+- name: Gitea setup
+  ansible.builtin.debug:
+    msg: "Setting up Gitea admin account..."
+
+# =============================================================================
+# Wait for Gitea API
+# =============================================================================
+
+- name: Wait for Gitea API
+  ansible.builtin.uri:
+    url: "{{ gitea_api_url }}/version"
+    method: GET
+    status_code: [200]
+  register: gitea_ready
+  until: gitea_ready.status == 200
+  retries: 12
+  delay: 5
+  failed_when: false
+
+- name: Fail if Gitea not ready
+  ansible.builtin.fail:
+    msg: "Gitea API not responding after timeout"
+  when: gitea_ready.status | default(0) != 200
+
+# =============================================================================
+# Check/Create Admin User
+# =============================================================================
+
+- name: Check if admin user exists
+  ansible.builtin.uri:
+    url: "{{ gitea_api_url }}/users/{{ admin_username }}"
+    method: GET
+    status_code: [200, 404]
+  register: admin_check
+  failed_when: false
+
+- name: Create admin user via CLI
+  when: admin_check.status != 200
+  block:
+    - name: Create admin user
+      ansible.builtin.command: >
+        docker exec -u git gitea gitea admin user create
+        --config /data/gitea/conf/app.ini
+        --username "{{ admin_username }}"
+        --password "{{ admin_password }}"
+        --email "{{ admin_email }}"
+        --admin
+        --must-change-password=false
+      register: create_user
+      changed_when: create_user.rc == 0
+      failed_when: false
+
+    - name: Verify admin user created
+      ansible.builtin.uri:
+        url: "{{ gitea_api_url }}/users/{{ admin_username }}"
+        method: GET
+        status_code: [200]
+      register: verify_admin
+      retries: 3
+      delay: 2
+      until: verify_admin.status == 200
+      failed_when: false
+
+    - name: Display admin creation status
+      ansible.builtin.debug:
+        msg: "{{ 'Admin user created' if verify_admin.status == 200 else 'Admin creation may have failed' }}"
+
+- name: Admin user exists
+  ansible.builtin.debug:
+    msg: "Admin user '{{ admin_username }}' already exists"
+  when: admin_check.status == 200
+
+# =============================================================================
+# Generate API Token
+# =============================================================================
+
+- name: Generate API token
+  ansible.builtin.uri:
+    url: "{{ gitea_api_url }}/users/{{ admin_username }}/tokens"
+    method: POST
+    user: "{{ admin_username }}"
+    password: "{{ admin_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "paas-bootstrap-{{ ansible_date_time.epoch }}"
+      scopes:
+        - "all"
+    status_code: [201]
+  register: token_response
+  retries: 5
+  delay: 3
+  until: token_response.status == 201
+  failed_when: false
+
+- name: Set Gitea token
+  ansible.builtin.set_fact:
+    gitea_token: "{{ token_response.json.sha1 }}"
+  when: token_response.json.sha1 is defined
+
+- name: Verify token works
+  ansible.builtin.uri:
+    url: "{{ gitea_api_url }}/user"
+    method: GET
+    headers:
+      Authorization: "token {{ gitea_token }}"
+    status_code: [200]
+  register: token_verify
+  when: gitea_token | length > 0
+  failed_when: false
+
+- name: Display token status
+  ansible.builtin.debug:
+    msg: "{{ 'API token generated and verified' if token_verify.status | default(0) == 200 else 'API token generation may have failed' }}"
+
+# =============================================================================
+# Update .env with token
+# =============================================================================
+
+- name: Update .env with Gitea token
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^GITEA_TOKEN="
+    line: "GITEA_TOKEN={{ gitea_token }}"
+  when: gitea_token | length > 0
+
+- name: Gitea setup complete
+  ansible.builtin.debug:
+    msg: "Gitea admin account configured"

@@ -1,0 +1,189 @@
+---
+# =============================================================================
+# PaaS AI Stack - Full Bootstrap Playbook
+# =============================================================================
+# Complete setup from scratch - generates secrets, configures Cloudflare,
+# deploys services, creates admin accounts, and sets up integrations.
+#
+# Usage:
+#   ansible-playbook -i inventory/localhost.yml bootstrap.yml
+#   ansible-playbook -i inventory/production.yml bootstrap.yml
+#
+# Required Variables (set in inventory):
+#   - base_domain
+#   - admin_email
+#   - admin_password
+#   - cloudflare_tunnel_token OR (cloudflare_api_token + cloudflare_account_id)
+#   - At least one AI API key (anthropic, openrouter, openai, or gemini)
+# =============================================================================
+
+- name: PaaS AI Stack - Full Bootstrap
+  hosts: all
+  gather_facts: true
+
+  vars_files:
+    - inventory/group_vars/all.yml
+
+  pre_tasks:
+    - name: Display bootstrap banner
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════════
+                      PaaS AI Stack - Ansible Bootstrap
+          ═══════════════════════════════════════════════════════════════════
+          This will set up the complete stack including:
+            - Secret generation
+            - Cloudflare Tunnel configuration
+            - Docker services deployment
+            - Admin account creation
+            - CI/CD integration
+
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - base_domain | length > 0
+          - base_domain != 'YOUR_DOMAIN_HERE'
+          - admin_email | length > 0
+          - admin_email != 'admin@YOUR_DOMAIN'
+          - admin_password | length >= 8
+        fail_msg: |
+          Missing or invalid required variables.
+
+          Set these in your inventory (inventory/group_vars/all.yml):
+            base_domain: your-domain.com
+            admin_email: admin@your-domain.com
+            admin_password: <strong-password>
+
+    - name: Validate Cloudflare configuration
+      ansible.builtin.assert:
+        that:
+          - (cloudflare_tunnel_token | length > 0) or (cloudflare_api_token | length > 0 and cloudflare_account_id | length > 0)
+        fail_msg: |
+          Missing Cloudflare configuration.
+
+          Either provide:
+            cloudflare_tunnel_token: <your-tunnel-token>
+
+          Or provide API credentials for auto-creation:
+            cloudflare_api_token: <your-api-token>
+            cloudflare_account_id: <your-account-id>
+
+    - name: Check for AI API key
+      ansible.builtin.set_fact:
+        has_ai_key: "{{ (anthropic_api_key | length > 0) or (openrouter_api_key | length > 0) or (openai_api_key | length > 0) or (gemini_api_key | length > 0) }}"
+
+    - name: Validate AI API key
+      ansible.builtin.assert:
+        that:
+          - has_ai_key
+        fail_msg: |
+          At least one AI API key is required for OpenClaw.
+
+          Set one of:
+            anthropic_api_key: <key>
+            openrouter_api_key: <key>
+            openai_api_key: <key>
+            gemini_api_key: <key>
+
+  roles:
+    - role: prerequisites
+      tags: [prerequisites]
+
+    - role: secrets
+      tags: [secrets]
+
+    - role: cloudflare
+      tags: [cloudflare]
+
+    - role: deploy
+      tags: [deploy]
+
+    - role: gitea
+      tags: [gitea]
+
+    - role: coolify
+      tags: [coolify]
+
+    - role: n8n
+      tags: [n8n]
+
+    - role: lobechat
+      tags: [lobechat]
+
+    - role: openclaw
+      tags: [openclaw]
+
+    - role: integration
+      tags: [integration]
+
+    - role: sample_app
+      tags: [sample_app]
+      when: deploy_sample_app | default(false)
+
+  post_tasks:
+    - name: Build action items list
+      ansible.builtin.set_fact:
+        action_items: >-
+          {{ [] 
+             + (['Change Casdoor admin password (default is admin/123)'] if casdoor_password_default | default(false) else [])
+             + (['Validate Coolify server: https://' ~ coolify_domain ~ ' → Servers → Validate'] if not (coolify_server_validated | default(false)) else [])
+          }}
+
+    - name: Display completion summary
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════════
+                              Bootstrap Complete!
+          ═══════════════════════════════════════════════════════════════════
+
+          SERVICES:
+          ┌─────────────────────────────────────────────────────────────────┐
+          │  Gitea:     https://{{ gitea_domain }}
+          │  Coolify:   https://{{ coolify_domain }}
+          │  n8n:       https://{{ n8n_domain }}
+          │  LobeChat:  https://{{ lobe_domain }}
+          │  Casdoor:   https://{{ casdoor_domain }}
+          └─────────────────────────────────────────────────────────────────┘
+
+          OPENCLAW AI GATEWAY:
+          ┌─────────────────────────────────────────────────────────────────┐
+          │  Dashboard: https://{{ openclaw_domain }}/?token={{ openclaw_gateway_token }}
+          │  API Base:  https://{{ openclaw_domain }}/v1
+          │  Token:     {{ openclaw_gateway_token }}
+          └─────────────────────────────────────────────────────────────────┘
+
+          LOGIN CREDENTIALS:
+          ┌─────────────────────────────────────────────────────────────────┐
+          │  Gitea / Coolify / n8n:
+          │    Username: {{ admin_username }}
+          │    Email:    {{ admin_email }}
+          │    Password: (configured in inventory)
+          │
+          │  LobeChat:
+          │    Login via Casdoor SSO
+          │
+          │  Casdoor Admin:
+          │    Username: admin
+          │    Password: {{ '123 (DEFAULT - CHANGE IMMEDIATELY!)' if casdoor_password_default | default(false) else '(previously configured)' }}
+          └─────────────────────────────────────────────────────────────────┘
+
+          {% if action_items | length > 0 %}
+          ACTION REQUIRED:
+          ┌─────────────────────────────────────────────────────────────────┐
+          {% for item in action_items %}
+          │  → {{ item }}
+          {% endfor %}
+          └─────────────────────────────────────────────────────────────────┘
+          {% endif %}
+
+          COMMANDS:
+          ┌─────────────────────────────────────────────────────────────────┐
+          │  make status           - Check service health
+          │  make logs             - View all logs
+          │  make backup           - Backup data
+          │  make validate-coolify - Retry server validation
+          └─────────────────────────────────────────────────────────────────┘
+
+          Configuration saved to: {{ paas_env_file }}
+
+          ═══════════════════════════════════════════════════════════════════

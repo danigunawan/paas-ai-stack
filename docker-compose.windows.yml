@@ -1,0 +1,48 @@
+# Windows-specific Docker Compose overrides
+# Used automatically by bootstrap.sh when running on Windows
+#
+# Why this is needed:
+# PostgreSQL containers fail on Windows because NTFS doesn't support
+# Linux UID/GID ownership. Bind mounts break PostgreSQL's permission
+# requirements. Named volumes work because Docker manages them internally.
+
+volumes:
+  postgres-git-data:
+  postgres-n8n-data:
+  coolify-db-data:
+  coolify-redis-data:
+
+services:
+  # PostgreSQL containers - use named volumes instead of bind mounts
+  postgres-git:
+    volumes:
+      - postgres-git-data:/var/lib/postgresql/data
+
+  coolify-db:
+    volumes:
+      - coolify-db-data:/var/lib/postgresql/data
+
+  postgres-n8n:
+    volumes:
+      - postgres-n8n-data:/var/lib/postgresql/data
+
+  # Redis also needs named volume on Windows
+  coolify-redis:
+    volumes:
+      - coolify-redis-data:/data
+
+  # Remove /etc/timezone and /etc/localtime mounts (don't exist on Windows)
+  gitea:
+    volumes:
+      - ./data/gitea:/data
+
+  n8n:
+    volumes:
+      - ./data/n8n:/home/node/.n8n
+
+  openclaw-cli:
+    volumes:
+      - ./data/openclaw:/root/.openclaw
+      - ./data/openclaw-workspace:/root/openclaw-workspace
+      - ./scripts:/srv/paas/scripts:ro
+      - ./skills:/srv/paas/skills:ro

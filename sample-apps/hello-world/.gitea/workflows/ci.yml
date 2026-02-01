@@ -1,0 +1,37 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    # Use self-hosted for Gitea Actions (not ubuntu-latest which is GitHub-specific)
+    runs-on: self-hosted
+    steps:
+      - name: Check tools
+        run: |
+          echo "Checking available tools..."
+          which docker git curl || true
+          docker --version || echo "Docker not found"
+          
+      - name: Checkout
+        # Clone from Gitea (not GitHub)
+        run: |
+          git clone https://gitea.digpulsepi.com/${{ gitea.repository }}.git repo
+          cd repo && git checkout ${{ gitea.sha }}
+          
+      - name: Build
+        run: |
+          cd repo
+          docker build -t hello-world:test .
+          
+      - name: Test
+        run: |
+          docker run --rm hello-world:test echo "Container works!"
+          
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rmi hello-world:test 2>/dev/null || true
+          rm -rf repo 2>/dev/null || true

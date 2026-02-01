@@ -1,0 +1,46 @@
+# Environment with secrets
+.env
+.env.local
+.env.backup
+.env.tmp
+
+# Data directories (runtime data)
+data/
+data2/
+
+# Backups
+backups/
+
+# Deploy keys (generated at runtime)
+scripts/deploy-keys/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Node (if applicable)
+node_modules/
+
+# Python (if applicable)
+__pycache__/
+*.pyc
+.venv/
+venv/

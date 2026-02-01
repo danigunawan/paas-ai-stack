@@ -1,0 +1,253 @@
+---
+# Deploy role - Start Docker Compose stack
+
+- name: Deploy services
+  ansible.builtin.debug:
+    msg: "Deploying PaaS AI Stack..."
+
+# =============================================================================
+# Create Data Directories
+# =============================================================================
+
+- name: Create data directories
+  ansible.builtin.file:
+    path: "{{ paas_data_dir }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ data_directories }}"
+
+# =============================================================================
+# Pull Docker Images
+# =============================================================================
+
+- name: Pull Docker images
+  ansible.builtin.command: docker compose {{ compose_files }} --env-file .env pull --quiet
+  args:
+    chdir: "{{ paas_root }}"
+  register: pull_result
+  changed_when: "'Downloaded' in pull_result.stdout or pull_result.rc == 0"
+  failed_when: pull_result.rc != 0
+
+- name: Display pull status
+  ansible.builtin.debug:
+    msg: "Docker images pulled successfully"
+
+# =============================================================================
+# Start Services
+# =============================================================================
+
+- name: Start all services
+  ansible.builtin.command: docker compose {{ compose_files }} --env-file .env up -d
+  args:
+    chdir: "{{ paas_root }}"
+  register: up_result
+  changed_when: "'Started' in up_result.stdout or 'Created' in up_result.stdout or up_result.rc == 0"
+
+# =============================================================================
+# Wait for Database Layer
+# =============================================================================
+
+- name: Wait for database services
+  ansible.builtin.debug:
+    msg: |
+      Waiting for services to be healthy...
+      This may take 2-5 minutes on first run.
+
+- name: Wait for postgres-git
+  community.docker.docker_container_info:
+    name: postgres-git
+  register: postgres_git_info
+  until: postgres_git_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (database_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for coolify-db
+  community.docker.docker_container_info:
+    name: coolify-db
+  register: coolify_db_info
+  until: coolify_db_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (database_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for postgres-n8n
+  community.docker.docker_container_info:
+    name: postgres-n8n
+  register: postgres_n8n_info
+  until: postgres_n8n_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (database_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for lobe-postgres
+  community.docker.docker_container_info:
+    name: lobe-postgres
+  register: lobe_postgres_info
+  until: lobe_postgres_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (database_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Check database layer health
+  ansible.builtin.set_fact:
+    databases_healthy: >-
+      {{ (postgres_git_info.container.State.Health.Status | default('unhealthy')) == 'healthy' and
+         (coolify_db_info.container.State.Health.Status | default('unhealthy')) == 'healthy' and
+         (postgres_n8n_info.container.State.Health.Status | default('unhealthy')) == 'healthy' and
+         (lobe_postgres_info.container.State.Health.Status | default('unhealthy')) == 'healthy' }}
+
+- name: Fail if databases not healthy
+  ansible.builtin.fail:
+    msg: "Database services not healthy. Check logs with: docker logs <container-name>"
+  when: not databases_healthy
+
+- name: Display database layer status
+  ansible.builtin.debug:
+    msg: "Database layer healthy"
+
+# Allow databases to stabilize
+- name: Wait for database stabilization
+  ansible.builtin.pause:
+    seconds: 5
+
+# =============================================================================
+# Wait for Application Layer
+# =============================================================================
+
+- name: Wait for Gitea
+  community.docker.docker_container_info:
+    name: gitea
+  register: gitea_info
+  until: gitea_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (health_check_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for Gitea API
+  ansible.builtin.uri:
+    url: "{{ gitea_url | default('http://127.0.0.1:3000') }}/api/v1/version"
+    method: GET
+    status_code: [200]
+  register: gitea_api
+  until: gitea_api.status == 200
+  retries: "{{ (api_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for Coolify
+  community.docker.docker_container_info:
+    name: coolify
+  register: coolify_info
+  until: coolify_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (health_check_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for Coolify API
+  ansible.builtin.uri:
+    url: "{{ coolify_url | default('http://127.0.0.1:8080') }}/api/health"
+    method: GET
+    status_code: [200]
+  register: coolify_api
+  until: coolify_api.status == 200
+  retries: "{{ (api_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for n8n
+  community.docker.docker_container_info:
+    name: n8n
+  register: n8n_info
+  until: n8n_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (health_check_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for n8n API
+  ansible.builtin.uri:
+    url: "{{ n8n_url | default('http://127.0.0.1:5678') }}/healthz"
+    method: GET
+    status_code: [200]
+  register: n8n_api
+  until: n8n_api.status == 200
+  retries: "{{ (api_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for Casdoor
+  community.docker.docker_container_info:
+    name: lobe-casdoor
+  register: casdoor_info
+  until: casdoor_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (health_check_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for Casdoor API
+  ansible.builtin.uri:
+    url: "{{ casdoor_url | default('http://127.0.0.1:8000') }}/api/health"
+    method: GET
+    status_code: [200]
+  register: casdoor_api
+  until: casdoor_api.status == 200
+  retries: "{{ (api_health_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+- name: Wait for LobeChat
+  community.docker.docker_container_info:
+    name: lobe-chat
+  register: lobechat_info
+  until: lobechat_info.container.State.Health.Status == 'healthy'
+  retries: "{{ (health_check_timeout / 5) | int }}"
+  delay: 5
+  failed_when: false
+
+# =============================================================================
+# Wait for AI Gateway Layer
+# =============================================================================
+
+- name: Wait for OpenClaw
+  community.docker.docker_container_info:
+    name: openclaw-cli
+  register: openclaw_info
+  until: openclaw_info.container.State.Health.Status == 'healthy'
+  retries: 30
+  delay: 5
+  failed_when: false
+
+# =============================================================================
+# Service Status Summary
+# =============================================================================
+
+- name: Collect service health status
+  ansible.builtin.set_fact:
+    service_health:
+      gitea: "{{ gitea_info.container.State.Health.Status | default('unknown') }}"
+      coolify: "{{ coolify_info.container.State.Health.Status | default('unknown') }}"
+      n8n: "{{ n8n_info.container.State.Health.Status | default('unknown') }}"
+      casdoor: "{{ casdoor_info.container.State.Health.Status | default('unknown') }}"
+      lobechat: "{{ lobechat_info.container.State.Health.Status | default('unknown') }}"
+      openclaw: "{{ openclaw_info.container.State.Health.Status | default('unknown') }}"
+
+- name: Display service health
+  ansible.builtin.debug:
+    msg: |
+      Service Health Status:
+        Gitea: {{ service_health.gitea }}
+        Coolify: {{ service_health.coolify }}
+        n8n: {{ service_health.n8n }}
+        Casdoor: {{ service_health.casdoor }}
+        LobeChat: {{ service_health.lobechat }}
+        OpenClaw: {{ service_health.openclaw }}
+
+# Allow services to fully initialize
+- name: Wait for service initialization
+  ansible.builtin.pause:
+    seconds: 10
+    prompt: "Allowing services to fully initialize..."
+
+- name: Deploy complete
+  ansible.builtin.debug:
+    msg: "Services deployed and healthy"

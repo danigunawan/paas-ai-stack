@@ -1,0 +1,59 @@
+---
+# Windows-specific prerequisite tasks (WSL and Native Windows)
+
+- name: Display Windows environment detected
+  ansible.builtin.debug:
+    msg: |
+      Windows environment detected: {{ 'Native Windows' if is_windows_native else 'WSL' }}
+      Applying Windows-specific configuration...
+
+- name: Check for Windows compose override
+  ansible.builtin.stat:
+    path: "{{ paas_root }}/docker-compose.windows.yml"
+  register: windows_compose
+
+- name: Set Windows compose files
+  ansible.builtin.set_fact:
+    compose_files: "-f docker-compose.yml -f docker-compose.windows.yml"
+  when: windows_compose.stat.exists
+
+- name: Fail if Windows compose override missing
+  ansible.builtin.fail:
+    msg: |
+      docker-compose.windows.yml not found - PostgreSQL containers will fail on Windows.
+      This file is required for Windows compatibility (uses named volumes instead of bind mounts).
+  when: not windows_compose.stat.exists
+
+- name: Ensure coolify network exists
+  community.docker.docker_network:
+    name: coolify
+    state: present
+  failed_when: false
+
+# =============================================================================
+# Windows SSH Setup Notes
+# =============================================================================
+
+- name: Check if Windows SSH setup script exists
+  ansible.builtin.stat:
+    path: "{{ paas_scripts_dir }}/setup-windows-ssh.ps1"
+  register: windows_ssh_script
+
+- name: Display Windows SSH notes
+  ansible.builtin.debug:
+    msg: |
+      Windows Notes:
+        - Using named volumes for PostgreSQL (NTFS doesn't support Linux UID/GID)
+        - Database files stored in Docker volumes (not ./data/)
+        - Backup via pg_dump: docker exec postgres-git pg_dump -U gitea gitea > backup.sql
+        - 'Docker socket not writable' warning can be ignored on Windows
+        
+      For Coolify deployments (SSH requirement):
+        - Run in Administrator PowerShell: .\scripts\setup-windows-ssh.ps1
+        - This configures Windows OpenSSH Server for Coolify
+        - Admin users need keys in C:\ProgramData\ssh\administrators_authorized_keys
+        - Git Bash must be set as default SSH shell
+        
+      Post-bootstrap:
+        - Verify SSH: ssh localhost "echo SSH_TEST_OK"
+        - Validate Coolify server at: https://{{ coolify_domain }}/servers

@@ -1,0 +1,193 @@
+---
+# Sample App Deployment - Verify CI/CD Pipeline
+# Uses sample-apps/hello-world from the repository
+
+- name: Skip sample app deployment
+  ansible.builtin.debug:
+    msg: "Skipping sample app (deploy_sample_app: false)"
+  when: not deploy_sample_app
+
+- name: Deploy sample app
+  when: deploy_sample_app
+  block:
+    - name: Check if sample app repo exists
+      ansible.builtin.uri:
+        url: "{{ gitea_url }}/api/v1/repos/{{ admin_username }}/{{ sample_app_name }}"
+        method: GET
+        headers:
+          Authorization: "token {{ gitea_token }}"
+        status_code: [200, 404]
+      register: repo_check
+
+    # ==========================================================================
+    # Create Repository and Push Sample App
+    # ==========================================================================
+    - name: Create sample app repository
+      when: repo_check.status == 404
+      block:
+        - name: Create repository in Gitea
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/user/repos"
+            method: POST
+            headers:
+              Authorization: "token {{ gitea_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              name: "{{ sample_app_name }}"
+              description: "Sample app to verify CI/CD pipeline - deployed via Ansible"
+              private: false
+              auto_init: false
+              default_branch: "main"
+            status_code: [201]
+          register: create_repo
+
+        - name: Check for sample-apps source
+          ansible.builtin.stat:
+            path: "{{ paas_root }}/sample-apps/{{ sample_app_name }}"
+          register: sample_apps_source
+
+        - name: Create temp directory
+          ansible.builtin.tempfile:
+            state: directory
+          register: temp_dir
+
+        - name: Copy from sample-apps directory
+          when: sample_apps_source.stat.exists
+          ansible.builtin.shell: |
+            cp -r "{{ paas_root }}/sample-apps/{{ sample_app_name }}/." "{{ temp_dir.path }}/"
+          args:
+            creates: "{{ temp_dir.path }}/Dockerfile"
+
+        - name: Create sample app files from scratch
+          when: not sample_apps_source.stat.exists
+          block:
+            - name: Create Dockerfile
+              ansible.builtin.copy:
+                dest: "{{ temp_dir.path }}/Dockerfile"
+                mode: "0644"
+                content: |
+                  FROM nginx:alpine
+                  COPY index.html /usr/share/nginx/html/index.html
+                  EXPOSE 80
+                  CMD ["nginx", "-g", "daemon off;"]
+
+            - name: Create index.html
+              ansible.builtin.copy:
+                dest: "{{ temp_dir.path }}/index.html"
+                mode: "0644"
+                content: |
+                  <!DOCTYPE html>
+                  <html lang="en">
+                  <head>
+                      <meta charset="UTF-8">
+                      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                      <title>Hello from PaaS AI Stack</title>
+                      <style>
+                          body { font-family: system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin: 0; }
+                          .container { text-align: center; padding: 2rem; }
+                          h1 { font-size: 2.5rem; margin-bottom: 1rem; }
+                          p { font-size: 1.1rem; opacity: 0.9; }
+                      </style>
+                  </head>
+                  <body>
+                      <div class="container">
+                          <h1>Hello from PaaS AI Stack!</h1>
+                          <p>Deployed via: <strong>Gitea → Coolify (Ansible)</strong></p>
+                          <p>{{ ansible_date_time.iso8601 }}</p>
+                      </div>
+                  </body>
+                  </html>
+
+        - name: Initialize git repo
+          ansible.builtin.command: git init -b main
+          args:
+            chdir: "{{ temp_dir.path }}"
+
+        - name: Configure git user
+          ansible.builtin.shell: |
+            git config user.email "{{ admin_email }}"
+            git config user.name "{{ admin_username }}"
+          args:
+            chdir: "{{ temp_dir.path }}"
+
+        - name: Add and commit files
+          ansible.builtin.shell: |
+            git add .
+            git commit -m "Initial commit: Hello from PaaS AI Stack (Ansible)"
+          args:
+            chdir: "{{ temp_dir.path }}"
+
+        - name: Add remote and push
+          ansible.builtin.shell: |
+            git remote add origin "http://{{ admin_username }}:{{ gitea_token }}@{{ gitea_url | regex_replace('^https?://', '') }}/{{ admin_username }}/{{ sample_app_name }}.git"
+            git push -u origin main
+          args:
+            chdir: "{{ temp_dir.path }}"
+          register: push_result
+          retries: 3
+          delay: 3
+          until: push_result.rc == 0
+          failed_when: false
+
+        - name: Clean up temp directory
+          ansible.builtin.file:
+            path: "{{ temp_dir.path }}"
+            state: absent
+
+        - name: Display repo creation status
+          ansible.builtin.debug:
+            msg: "{{ 'Sample app pushed to: https://' ~ gitea_domain ~ '/' ~ admin_username ~ '/' ~ sample_app_name if push_result.rc == 0 else 'Push may have failed - check manually' }}"
+
+    # ==========================================================================
+    # Setup CI/CD Pipeline (using setup-ci-cd.sh)
+    # ==========================================================================
+    - name: Check for setup-ci-cd.sh script
+      ansible.builtin.stat:
+        path: "{{ paas_scripts_dir }}/setup-ci-cd.sh"
+      register: cicd_script
+
+    - name: Setup CI/CD pipeline
+      when: cicd_script.stat.exists and coolify_token | default('') | length > 0
+      block:
+        - name: Run setup-ci-cd.sh for sample app
+          ansible.builtin.command: >
+            bash "{{ paas_scripts_dir }}/setup-ci-cd.sh"
+            "{{ sample_app_name }}"
+            "{{ sample_app_subdomain }}"
+            "{{ sample_app_port }}"
+          args:
+            chdir: "{{ paas_root }}"
+          environment:
+            GITEA_TOKEN: "{{ gitea_token }}"
+            COOLIFY_TOKEN: "{{ coolify_token }}"
+            ADMIN_USERNAME: "{{ admin_username }}"
+            GITEA_DOMAIN: "{{ gitea_domain }}"
+            COOLIFY_DOMAIN: "{{ coolify_domain }}"
+            BASE_DOMAIN: "{{ base_domain }}"
+          register: cicd_setup
+          failed_when: false
+          changed_when: cicd_setup.rc == 0
+
+        - name: Display CI/CD setup status
+          ansible.builtin.debug:
+            msg: |
+              CI/CD Setup: {{ 'SUCCESS' if cicd_setup.rc == 0 else 'MANUAL SETUP REQUIRED' }}
+              {{ cicd_setup.stdout | default('') }}
+              
+              {{ 'App will be available at: https://' ~ sample_app_subdomain ~ '.' ~ base_domain if cicd_setup.rc == 0 else 'Run manually: bash scripts/setup-ci-cd.sh ' ~ sample_app_name ~ ' ' ~ sample_app_subdomain ~ ' ' ~ sample_app_port }}
+
+    - name: CI/CD script not available
+      ansible.builtin.debug:
+        msg: |
+          CI/CD script not found or Coolify token not set.
+          To setup CI/CD manually:
+            bash scripts/setup-ci-cd.sh {{ sample_app_name }} {{ sample_app_subdomain }} {{ sample_app_port }}
+      when: not cicd_script.stat.exists or coolify_token | default('') | length == 0
+
+    - name: Repo already exists
+      ansible.builtin.debug:
+        msg: |
+          Sample app repo already exists: https://{{ gitea_domain }}/{{ admin_username }}/{{ sample_app_name }}
+          To redeploy, trigger via Coolify or push new commits.
+      when: repo_check.status == 200

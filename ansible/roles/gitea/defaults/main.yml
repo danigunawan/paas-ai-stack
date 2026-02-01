@@ -1,0 +1,5 @@
+---
+# Gitea role defaults
+
+gitea_url: "http://127.0.0.1:3000"
+gitea_api_url: "{{ gitea_url }}/api/v1"

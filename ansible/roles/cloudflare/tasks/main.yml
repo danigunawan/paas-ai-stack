@@ -1,0 +1,226 @@
+---
+# Cloudflare role - Setup tunnel and routes
+
+- name: Cloudflare Tunnel setup
+  ansible.builtin.debug:
+    msg: "Setting up Cloudflare Tunnel..."
+
+# =============================================================================
+# Check if we need to create a tunnel
+# =============================================================================
+
+- name: Check if tunnel token already exists
+  ansible.builtin.set_fact:
+    have_tunnel_token: "{{ cloudflare_tunnel_token | length > 0 and cloudflare_tunnel_token != 'YOUR_TUNNEL_TOKEN' }}"
+    have_cf_api: "{{ cloudflare_api_token | length > 0 and cloudflare_api_token != 'YOUR_API_TOKEN' and cloudflare_account_id | length > 0 }}"
+
+- name: Skip tunnel creation if token exists
+  ansible.builtin.debug:
+    msg: "Using existing tunnel token"
+  when: have_tunnel_token
+
+# =============================================================================
+# Verify API Access (if creating tunnel)
+# =============================================================================
+
+- name: Verify Cloudflare API access
+  when:
+    - not have_tunnel_token
+    - have_cf_api
+  block:
+    - name: Test API token
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/user/tokens/verify"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        status_code: [200]
+      register: api_verify
+      failed_when: false
+
+    - name: Fail if API token invalid
+      ansible.builtin.fail:
+        msg: "Cloudflare API token invalid or insufficient permissions"
+      when: api_verify.status != 200 or not (api_verify.json.success | default(false))
+
+# =============================================================================
+# List Existing Tunnels
+# =============================================================================
+
+- name: List existing tunnels
+  ansible.builtin.uri:
+    url: "{{ cloudflare_api_base }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token }}"
+    status_code: [200]
+  register: tunnels_list
+  when:
+    - not have_tunnel_token
+    - have_cf_api
+
+- name: Find existing matching tunnel
+  ansible.builtin.set_fact:
+    existing_tunnel: "{{ tunnels_list.json.result | selectattr('deleted_at', 'none') | selectattr('name', 'search', base_domain | replace('.', '-') | default('paas-stack')) | first | default(none) }}"
+  when: tunnels_list.json is defined
+
+- name: Display found tunnel
+  ansible.builtin.debug:
+    msg: "Found existing tunnel: {{ existing_tunnel.name }} ({{ existing_tunnel.status }})"
+  when: existing_tunnel is defined and existing_tunnel
+
+# =============================================================================
+# Create New Tunnel
+# =============================================================================
+
+- name: Create new tunnel
+  when:
+    - not have_tunnel_token
+    - have_cf_api
+    - existing_tunnel is not defined or not existing_tunnel
+  block:
+    - name: Generate tunnel secret
+      ansible.builtin.set_fact:
+        tunnel_secret: "{{ lookup('community.general.random_string', length=32, special=false) | b64encode }}"
+
+    - name: Create tunnel via API
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "paas-stack-{{ base_domain | replace('.', '-') }}"
+          tunnel_secret: "{{ tunnel_secret }}"
+          config_src: "cloudflare"
+        status_code: [200]
+      register: create_tunnel
+      failed_when: not (create_tunnel.json.success | default(false))
+
+    - name: Set tunnel ID
+      ansible.builtin.set_fact:
+        tunnel_id: "{{ create_tunnel.json.result.id }}"
+        existing_tunnel: "{{ create_tunnel.json.result }}"
+
+    - name: Get tunnel token
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ tunnel_id }}/token"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        status_code: [200]
+      register: token_response
+
+    - name: Save tunnel token
+      ansible.builtin.set_fact:
+        cloudflare_tunnel_token: "{{ token_response.json.result }}"
+
+    - name: Display new tunnel info
+      ansible.builtin.debug:
+        msg: "Created tunnel: {{ existing_tunnel.name }}"
+
+# =============================================================================
+# Configure Tunnel Routes
+# =============================================================================
+
+- name: Configure tunnel routes
+  when:
+    - have_cf_api
+    - existing_tunnel is defined and existing_tunnel
+  block:
+    - name: Set tunnel ID from existing
+      ansible.builtin.set_fact:
+        tunnel_id: "{{ existing_tunnel.id }}"
+      when: tunnel_id is not defined
+
+    - name: Build ingress rules
+      ansible.builtin.set_fact:
+        ingress_rules: "{{ tunnel_routes + [{'service': 'http_status:404'}] }}"
+
+    - name: Update tunnel configuration
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ tunnel_id }}/configurations"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          config:
+            ingress: "{{ ingress_rules }}"
+        status_code: [200]
+      register: config_update
+      failed_when: false
+
+    - name: Display route config status
+      ansible.builtin.debug:
+        msg: "{{ 'Tunnel routes configured' if config_update.json.success | default(false) else 'Route configuration may need manual setup' }}"
+
+# =============================================================================
+# Create DNS Records
+# =============================================================================
+
+- name: Create DNS records
+  when:
+    - have_cf_api
+    - cloudflare_zone_id | length > 0
+    - tunnel_id is defined
+  block:
+    - name: Create DNS records for services
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/zones/{{ cloudflare_zone_id }}/dns_records"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          type: "CNAME"
+          name: "{{ item.hostname | regex_replace('\\.' ~ base_domain ~ '$', '') }}"
+          content: "{{ tunnel_id }}.cfargotunnel.com"
+          proxied: true
+        status_code: [200, 400]  # 400 = already exists
+      loop: "{{ tunnel_routes | rejectattr('hostname', 'search', '^\\*\\.') | list }}"
+      register: dns_create
+      failed_when: false
+
+    - name: Create wildcard DNS record
+      ansible.builtin.uri:
+        url: "{{ cloudflare_api_base }}/zones/{{ cloudflare_zone_id }}/dns_records"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          type: "CNAME"
+          name: "*"
+          content: "{{ tunnel_id }}.cfargotunnel.com"
+          proxied: true
+        status_code: [200, 400]
+      failed_when: false
+
+# =============================================================================
+# Final Validation
+# =============================================================================
+
+- name: Validate tunnel token exists
+  ansible.builtin.fail:
+    msg: |
+      No Cloudflare tunnel token available.
+      Either:
+        1. Set cloudflare_tunnel_token in your inventory
+        2. Or provide cloudflare_api_token + cloudflare_account_id to auto-create
+  when: cloudflare_tunnel_token | length == 0
+
+- name: Update .env with tunnel token
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^CLOUDFLARE_TUNNEL_TOKEN="
+    line: "CLOUDFLARE_TUNNEL_TOKEN={{ cloudflare_tunnel_token }}"
+
+- name: Cloudflare setup complete
+  ansible.builtin.debug:
+    msg: "Cloudflare Tunnel configured successfully"

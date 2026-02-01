@@ -1,0 +1,16 @@
+---
+# Prerequisites role defaults
+
+# Required tools to verify
+required_tools:
+  - curl
+  - jq
+  - openssl
+  - docker
+
+# Minimum requirements
+min_disk_gb: 10
+min_memory_gb: 4
+
+# Docker compose command (auto-detected)
+docker_compose_cmd: "docker compose"

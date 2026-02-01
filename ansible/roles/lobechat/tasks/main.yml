@@ -1,0 +1,173 @@
+---
+# LobeChat role - Setup Casdoor OAuth app
+
+- name: LobeChat setup
+  ansible.builtin.debug:
+    msg: "Setting up LobeChat OAuth configuration..."
+
+# =============================================================================
+# Check for Existing Casdoor App
+# =============================================================================
+
+- name: Check for existing LobeChat app in Casdoor
+  ansible.builtin.command: >
+    docker exec lobe-postgres psql -U postgres -d casdoor -t -c
+    "SELECT client_id FROM application WHERE name='lobechat'"
+  register: existing_app
+  changed_when: false
+  failed_when: false
+
+- name: Get existing credentials
+  when: existing_app.stdout | trim | length > 0
+  block:
+    - name: Get client ID
+      ansible.builtin.command: >
+        docker exec lobe-postgres psql -U postgres -d casdoor -t -c
+        "SELECT client_id FROM application WHERE name='lobechat'"
+      register: client_id_result
+      changed_when: false
+
+    - name: Get client secret
+      ansible.builtin.command: >
+        docker exec lobe-postgres psql -U postgres -d casdoor -t -c
+        "SELECT client_secret FROM application WHERE name='lobechat'"
+      register: client_secret_result
+      changed_when: false
+
+    - name: Set existing credentials
+      ansible.builtin.set_fact:
+        casdoor_client_id: "{{ client_id_result.stdout | trim }}"
+        casdoor_client_secret: "{{ client_secret_result.stdout | trim }}"
+
+    - name: Display existing app
+      ansible.builtin.debug:
+        msg: "LobeChat app already exists in Casdoor"
+
+# =============================================================================
+# Create Casdoor OAuth App
+# =============================================================================
+
+- name: Create LobeChat OAuth app
+  when: existing_app.stdout | trim | length == 0
+  block:
+    - name: Generate OAuth credentials
+      ansible.builtin.set_fact:
+        new_client_id: "{{ lookup('community.general.random_string', length=20, special=false) }}"
+        new_client_secret: "{{ lookup('community.general.random_string', length=40, special=false) }}"
+
+    - name: Create application in Casdoor database
+      ansible.builtin.command: >
+        docker exec lobe-postgres psql -U postgres -d casdoor -c
+        "INSERT INTO application (owner, name, created_time, display_name, organization, client_id, client_secret, redirect_uris, enable_password, enable_sign_up, token_format)
+         VALUES ('admin', 'lobechat', '{{ ansible_date_time.iso8601 }}', 'LobeChat', 'built-in', '{{ new_client_id }}', '{{ new_client_secret }}',
+                 '[\"https://{{ lobe_domain }}/api/auth/callback/casdoor\"]', true, true, 'JWT')"
+      register: create_app
+      changed_when: create_app.rc == 0
+
+    - name: Set new credentials
+      ansible.builtin.set_fact:
+        casdoor_client_id: "{{ new_client_id }}"
+        casdoor_client_secret: "{{ new_client_secret }}"
+
+    - name: Display new app
+      ansible.builtin.debug:
+        msg: "LobeChat OAuth app created in Casdoor"
+
+# =============================================================================
+# Check Casdoor Admin Password Status
+# =============================================================================
+
+- name: Check if Casdoor admin using default password
+  ansible.builtin.uri:
+    url: "{{ casdoor_url }}/api/login"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      application: "app-built-in"
+      organization: "built-in"
+      username: "admin"
+      password: "123"
+      type: "login"
+    status_code: [200]
+  register: default_password_check
+  failed_when: false
+
+- name: Set Casdoor password status
+  ansible.builtin.set_fact:
+    casdoor_password_default: "{{ default_password_check.json.status | default('') == 'ok' }}"
+
+- name: Display Casdoor password warning
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Casdoor admin using default password (123)
+      ACTION REQUIRED: Update password after first login at https://{{ casdoor_domain }}
+  when: casdoor_password_default
+
+# =============================================================================
+# Update .env with Casdoor Credentials
+# =============================================================================
+
+- name: Update .env with Casdoor client ID
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^CASDOOR_CLIENT_ID="
+    line: "CASDOOR_CLIENT_ID={{ casdoor_client_id }}"
+
+- name: Update .env with Casdoor client secret
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^CASDOOR_CLIENT_SECRET="
+    line: "CASDOOR_CLIENT_SECRET={{ casdoor_client_secret }}"
+
+# =============================================================================
+# Restart LobeChat with New Credentials
+# =============================================================================
+
+- name: Restart LobeChat to pick up new credentials
+  ansible.builtin.command: >
+    docker compose {{ compose_files }} --env-file .env up -d lobe-chat --force-recreate
+  args:
+    chdir: "{{ paas_root }}"
+  environment:
+    CASDOOR_CLIENT_ID: "{{ casdoor_client_id }}"
+    CASDOOR_CLIENT_SECRET: "{{ casdoor_client_secret }}"
+  changed_when: true
+
+- name: Wait for LobeChat to restart
+  ansible.builtin.pause:
+    seconds: 8
+
+- name: Verify LobeChat credentials
+  ansible.builtin.command: docker exec lobe-chat printenv AUTH_CASDOOR_ID
+  register: verify_creds
+  changed_when: false
+  failed_when: false
+
+- name: Display credential verification
+  ansible.builtin.debug:
+    msg: "{{ 'LobeChat credentials verified' if verify_creds.stdout | trim == casdoor_client_id else 'LobeChat credentials may need manual verification' }}"
+
+# =============================================================================
+# Mark Users as Onboarded
+# =============================================================================
+
+- name: Check for non-onboarded users
+  ansible.builtin.command: >
+    docker exec lobe-postgres psql -U postgres -d lobechat -t -c
+    "SELECT COUNT(*) FROM users WHERE is_onboarded = false"
+  register: non_onboarded
+  changed_when: false
+  failed_when: false
+
+- name: Mark users as onboarded
+  when: non_onboarded.stdout | trim | int > 0
+  ansible.builtin.command: >
+    docker exec lobe-postgres psql -U postgres -d lobechat -c
+    "UPDATE users SET is_onboarded = true, full_name = COALESCE(full_name, '{{ admin_username }}') WHERE is_onboarded = false"
+  changed_when: true
+
+- name: LobeChat setup complete
+  ansible.builtin.debug:
+    msg: "LobeChat OAuth configured"

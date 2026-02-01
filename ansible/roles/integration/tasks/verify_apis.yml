@@ -1,0 +1,154 @@
+---
+# Verify all API access for OpenClaw integration
+
+- name: Verify API access
+  ansible.builtin.debug:
+    msg: "Verifying API access for all services..."
+
+# =============================================================================
+# Gitea API
+# =============================================================================
+
+- name: Test Gitea API
+  ansible.builtin.uri:
+    url: "{{ gitea_url }}/api/v1/user"
+    method: GET
+    headers:
+      Authorization: "token {{ gitea_token }}"
+    status_code: [200]
+  register: gitea_api_test
+  when: gitea_token | length > 0
+  failed_when: false
+
+- name: Display Gitea API status
+  ansible.builtin.debug:
+    msg: "{{ '✓ Gitea API: accessible (user: ' ~ gitea_api_test.json.login ~ ')' if gitea_api_test.status | default(0) == 200 else '⚠ Gitea API: token invalid or unreachable' }}"
+
+# =============================================================================
+# Coolify API
+# =============================================================================
+
+- name: Test Coolify API
+  ansible.builtin.uri:
+    url: "{{ coolify_url }}/api/v1/health"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ coolify_token }}"
+    status_code: [200]
+  register: coolify_api_test
+  when: coolify_token | length > 0
+  failed_when: false
+
+- name: Display Coolify API status
+  ansible.builtin.debug:
+    msg: "{{ '✓ Coolify API: accessible' if coolify_api_test.status | default(0) == 200 else '⚠ Coolify API: may need setup' }}"
+
+# =============================================================================
+# n8n API
+# =============================================================================
+
+- name: Test n8n API
+  ansible.builtin.uri:
+    url: "{{ n8n_url }}/api/v1/workflows"
+    method: GET
+    headers:
+      X-N8N-API-KEY: "{{ n8n_token }}"
+    status_code: [200]
+  register: n8n_api_test
+  when: n8n_token | length > 0
+  failed_when: false
+
+- name: Display n8n API status
+  ansible.builtin.debug:
+    msg: "{{ '✓ n8n API: accessible' if n8n_api_test.status | default(0) == 200 else '⚠ n8n API: may need setup completion' }}"
+
+# =============================================================================
+# OpenClaw Gateway
+# =============================================================================
+
+- name: Test OpenClaw Gateway
+  ansible.builtin.uri:
+    url: "{{ openclaw_url }}/health"
+    method: GET
+    status_code: [200]
+  register: openclaw_api_test
+  failed_when: false
+
+- name: Display OpenClaw status
+  ansible.builtin.debug:
+    msg: "{{ '✓ OpenClaw Gateway: accessible' if openclaw_api_test.status | default(0) == 200 else '⚠ OpenClaw Gateway: starting up...' }}"
+
+# =============================================================================
+# Retry Token Generation if APIs Failed
+# =============================================================================
+
+- name: Check if any APIs failed
+  ansible.builtin.set_fact:
+    any_api_failed: "{{ gitea_api_test.status | default(0) != 200 or coolify_api_test.status | default(0) != 200 or n8n_api_test.status | default(0) != 200 }}"
+
+- name: Retry Gitea token generation
+  when:
+    - any_api_failed
+    - gitea_api_test.status | default(0) != 200
+  block:
+    - name: Wait before retry
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Regenerate Gitea token
+      ansible.builtin.uri:
+        url: "{{ gitea_url }}/api/v1/users/{{ admin_username }}/tokens"
+        method: POST
+        user: "{{ admin_username }}"
+        password: "{{ admin_password }}"
+        force_basic_auth: true
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "paas-retry-{{ ansible_date_time.epoch }}"
+          scopes:
+            - "all"
+        status_code: [201]
+      register: retry_gitea_token
+      failed_when: false
+
+    - name: Update Gitea token in .env
+      ansible.builtin.lineinfile:
+        path: "{{ paas_env_file }}"
+        regexp: "^GITEA_TOKEN="
+        line: "GITEA_TOKEN={{ retry_gitea_token.json.sha1 }}"
+      when: retry_gitea_token.json.sha1 is defined
+
+    - name: Display Gitea retry status
+      ansible.builtin.debug:
+        msg: "{{ '✓ Gitea API token regenerated' if retry_gitea_token.json.sha1 is defined else '⚠ Gitea token retry failed' }}"
+
+- name: Re-enable Coolify API if needed
+  when:
+    - any_api_failed
+    - coolify_api_test.status | default(0) != 200
+  ansible.builtin.command: >
+    docker exec coolify php artisan tinker --execute="
+    \$setting = \App\Models\InstanceSettings::first();
+    if (\$setting) {
+        \$setting->is_api_enabled = true;
+        \$setting->save();
+        echo 'API enabled';
+    }
+    "
+  changed_when: true
+  failed_when: false
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+- name: Display API verification summary
+  ansible.builtin.debug:
+    msg: |
+      API Verification Complete:
+        Gitea:    {{ '✓' if gitea_api_test.status | default(0) == 200 else '⚠' }}
+        Coolify:  {{ '✓' if coolify_api_test.status | default(0) == 200 else '⚠' }}
+        n8n:      {{ '✓' if n8n_api_test.status | default(0) == 200 else '⚠' }}
+        OpenClaw: {{ '✓' if openclaw_api_test.status | default(0) == 200 else '⚠' }}

@@ -1,0 +1,267 @@
+---
+# Prerequisites role - Verify and install requirements
+
+- name: Display bootstrap start message
+  ansible.builtin.debug:
+    msg: |
+      ============================================
+        PaaS AI Stack - Ansible Bootstrap
+      ============================================
+
+- name: Gather facts
+  ansible.builtin.setup:
+    gather_subset:
+      - hardware
+      - network
+      - virtual
+
+# =============================================================================
+# Platform Detection
+# =============================================================================
+
+- name: Detect platform
+  ansible.builtin.set_fact:
+    is_macos: "{{ ansible_os_family == 'Darwin' }}"
+    is_linux: "{{ ansible_os_family in ['Debian', 'RedHat', 'Archlinux', 'Alpine'] }}"
+    is_windows_wsl: "{{ ansible_kernel is defined and 'microsoft' in ansible_kernel | lower }}"
+    is_windows_native: "{{ ansible_os_family == 'Windows' }}"
+    is_raspberry_pi: "{{ ansible_machine == 'aarch64' and ansible_os_family != 'Darwin' }}"
+
+- name: Combine Windows detection
+  ansible.builtin.set_fact:
+    is_windows: "{{ is_windows_wsl or is_windows_native }}"
+
+- name: Set platform-specific variables
+  ansible.builtin.set_fact:
+    compose_files: "{{ '-f docker-compose.yml -f docker-compose.windows.yml' if is_windows else '' }}"
+
+- name: Display detected platform
+  ansible.builtin.debug:
+    msg: |
+      Platform: {{ 'macOS' if is_macos else ('Windows (Native)' if is_windows_native else ('Windows (WSL)' if is_windows_wsl else ('Raspberry Pi' if is_raspberry_pi else 'Linux'))) }}
+      Architecture: {{ ansible_machine }}
+      OS Family: {{ ansible_os_family }}
+
+# =============================================================================
+# Docker Verification
+# =============================================================================
+
+- name: Check if Docker is installed
+  ansible.builtin.command: docker --version
+  register: docker_version_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker is not installed
+  ansible.builtin.fail:
+    msg: |
+      Docker is not installed. Please install Docker first:
+        curl -fsSL https://get.docker.com | sh
+        sudo usermod -aG docker $USER
+        # Log out and back in, then run again
+  when: docker_version_check.rc != 0
+
+- name: Display Docker version
+  ansible.builtin.debug:
+    msg: "Docker installed: {{ docker_version_check.stdout }}"
+
+- name: Check if Docker Compose is available
+  ansible.builtin.command: docker compose version
+  register: compose_version_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker Compose is not available
+  ansible.builtin.fail:
+    msg: |
+      Docker Compose is not available.
+      Install with: sudo apt install docker-compose-plugin
+  when: compose_version_check.rc != 0
+
+- name: Display Docker Compose version
+  ansible.builtin.debug:
+    msg: "Docker Compose installed: {{ compose_version_check.stdout }}"
+
+- name: Check if Docker is running
+  ansible.builtin.command: docker info
+  register: docker_info
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker is not running
+  ansible.builtin.fail:
+    msg: |
+      Docker is not running.
+      {% if is_linux %}
+      Start with: sudo systemctl start docker
+      {% else %}
+      Please start Docker Desktop.
+      {% endif %}
+  when: docker_info.rc != 0
+
+- name: Check Docker socket permissions
+  ansible.builtin.stat:
+    path: /var/run/docker.sock
+  register: docker_socket
+
+- name: Warn if Docker socket not writable
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Docker socket may not be writable by current user.
+      Add yourself to docker group:
+        sudo usermod -aG docker $USER
+        # Then log out and back in
+  when: docker_socket.stat.exists and not docker_socket.stat.writeable | default(true)
+
+# =============================================================================
+# Required Tools
+# =============================================================================
+
+- name: Check required tools
+  ansible.builtin.command: "which {{ item }}"
+  register: tool_checks
+  loop: "{{ required_tools }}"
+  changed_when: false
+  failed_when: false
+
+- name: Identify missing tools
+  ansible.builtin.set_fact:
+    missing_tools: "{{ tool_checks.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
+
+- name: Display missing tools warning
+  ansible.builtin.debug:
+    msg: |
+      Missing tools: {{ missing_tools | join(', ') }}
+      Install with:
+        Debian/Ubuntu: sudo apt install curl jq openssl gettext-base
+        macOS: brew install jq openssl gettext
+  when: missing_tools | length > 0
+
+- name: Install missing tools on Debian/Ubuntu
+  ansible.builtin.apt:
+    name:
+      - curl
+      - jq
+      - openssl
+      - gettext-base
+    state: present
+    update_cache: true
+  become: true
+  when:
+    - ansible_os_family == 'Debian'
+    - missing_tools | length > 0
+
+- name: Install missing tools on RHEL/CentOS
+  ansible.builtin.dnf:
+    name:
+      - curl
+      - jq
+      - openssl
+      - gettext
+    state: present
+  become: true
+  when:
+    - ansible_os_family == 'RedHat'
+    - missing_tools | length > 0
+
+# =============================================================================
+# System Resources Check
+# =============================================================================
+
+- name: Check available disk space
+  ansible.builtin.shell: |
+    if command -v df &> /dev/null; then
+      df -BG . 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G' || \
+      df -g . 2>/dev/null | tail -1 | awk '{print $4}' || echo "100"
+    else
+      echo "100"
+    fi
+  args:
+    chdir: "{{ paas_root }}"
+  register: disk_space
+  changed_when: false
+
+- name: Warn about low disk space
+  ansible.builtin.debug:
+    msg: "WARNING: Low disk space: {{ disk_space.stdout }}GB available ({{ min_disk_gb }}GB+ recommended)"
+  when: disk_space.stdout | int < min_disk_gb
+
+- name: Check available memory
+  ansible.builtin.set_fact:
+    total_memory_gb: "{{ (ansible_memtotal_mb | default(8192)) / 1024 | round(1) }}"
+
+- name: Warn about low memory
+  ansible.builtin.debug:
+    msg: "WARNING: Low memory: {{ total_memory_gb }}GB available ({{ min_memory_gb }}GB+ recommended)"
+  when: total_memory_gb | float < min_memory_gb
+
+# =============================================================================
+# SSH Verification (for Coolify deployments)
+# =============================================================================
+
+- name: Check if SSH is accessible on localhost
+  ansible.builtin.wait_for:
+    host: localhost
+    port: 22
+    timeout: 5
+    state: started
+  register: ssh_check
+  failed_when: false
+
+- name: Warn if SSH is not running
+  ansible.builtin.debug:
+    msg: |
+      WARNING: SSH server not running on localhost (port 22 not accessible)
+      Coolify deployments require SSH access.
+      Enable SSH:
+        macOS: System Settings → General → Sharing → Remote Login
+        Linux: sudo systemctl enable --now sshd
+  when: ssh_check.failed is defined and ssh_check.failed
+
+- name: Check for passwordless sudo
+  ansible.builtin.command: sudo -n true
+  register: sudo_check
+  changed_when: false
+  failed_when: false
+
+- name: Warn if passwordless sudo not configured
+  ansible.builtin.debug:
+    msg: |
+      WARNING: Passwordless sudo not configured
+      Coolify deployments may fail.
+      Configure with: echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/coolify
+  when: sudo_check.rc != 0
+
+# =============================================================================
+# Platform-Specific Fixes
+# =============================================================================
+
+- name: Include macOS-specific tasks
+  ansible.builtin.include_tasks: macos.yml
+  when: is_macos
+
+- name: Include Windows-specific tasks
+  ansible.builtin.include_tasks: windows.yml
+  when: is_windows
+
+# =============================================================================
+# Create SSH directory
+# =============================================================================
+
+- name: Ensure SSH directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: Ensure authorized_keys exists
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh/authorized_keys"
+    state: touch
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Prerequisites complete
+  ansible.builtin.debug:
+    msg: "Prerequisites verified successfully"

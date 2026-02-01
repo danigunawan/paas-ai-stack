@@ -1,0 +1,8 @@
+---
+# Deploy handlers
+
+- name: Restart all services
+  ansible.builtin.command: docker compose {{ compose_files }} restart
+  args:
+    chdir: "{{ paas_root }}"
+  changed_when: true

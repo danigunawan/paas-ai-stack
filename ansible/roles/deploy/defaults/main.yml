@@ -1,0 +1,28 @@
+---
+# Deploy role defaults
+
+# Health check timeouts (seconds)
+health_check_timeout: 120
+database_health_timeout: 90
+api_health_timeout: 60
+
+# Data directories to create (matches Makefile init target)
+data_directories:
+  - postgres-git
+  - postgres-n8n
+  - coolify-db
+  - coolify-redis
+  - gitea
+  - gitea-actions
+  - coolify
+  - n8n
+  - openclaw
+  - openclaw-workspace
+  - openclaw-ssh
+  - coolify-ssh
+
+# Local API URLs for health checks
+gitea_url: "http://127.0.0.1:3000"
+coolify_url: "http://127.0.0.1:8080"
+n8n_url: "http://127.0.0.1:5678"
+casdoor_url: "http://127.0.0.1:8000"

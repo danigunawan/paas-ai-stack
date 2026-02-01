@@ -1,0 +1,121 @@
+---
+# OpenClaw role - Verify gateway configuration
+
+- name: OpenClaw setup
+  ansible.builtin.debug:
+    msg: "Verifying OpenClaw setup..."
+
+# =============================================================================
+# Wait for OpenClaw
+# =============================================================================
+
+- name: Wait for OpenClaw health
+  community.docker.docker_container_info:
+    name: openclaw-cli
+  register: openclaw_info
+  until: openclaw_info.container.State.Health.Status == 'healthy'
+  retries: 30
+  delay: 5
+  failed_when: false
+
+- name: Display OpenClaw status
+  ansible.builtin.debug:
+    msg: "OpenClaw: {{ openclaw_info.container.State.Health.Status | default('unknown') }}"
+
+# =============================================================================
+# Verify Configuration
+# =============================================================================
+
+- name: Check onboarding status
+  ansible.builtin.command: docker exec openclaw-cli ls /root/.openclaw/.onboarded
+  register: onboard_check
+  changed_when: false
+  failed_when: false
+
+- name: Display onboarding status
+  ansible.builtin.debug:
+    msg: "{{ 'Onboarding: complete' if onboard_check.rc == 0 else 'Onboarding: pending (will complete on first request)' }}"
+
+# =============================================================================
+# Verify Models
+# =============================================================================
+
+- name: Check configured models
+  ansible.builtin.command: docker exec openclaw-cli node dist/index.js models
+  register: models_check
+  changed_when: false
+  failed_when: false
+
+- name: Display model info
+  ansible.builtin.debug:
+    msg: "{{ models_check.stdout_lines | select('search', 'Default') | first | default('Models not yet configured (check API keys in .env)') }}"
+
+# =============================================================================
+# Verify HTTP API
+# =============================================================================
+
+- name: Check HTTP API configuration
+  ansible.builtin.command: docker exec openclaw-cli cat /root/.openclaw/openclaw.json
+  register: openclaw_config
+  changed_when: false
+  failed_when: false
+
+- name: Display HTTP API status
+  ansible.builtin.debug:
+    msg: "{{ 'HTTP API: enabled' if 'chatCompletions' in openclaw_config.stdout and 'true' in openclaw_config.stdout else 'HTTP API: will be enabled on first run' }}"
+
+# =============================================================================
+# Verify Skills
+# =============================================================================
+
+- name: Count available skills
+  ansible.builtin.command: docker exec openclaw-cli ls /srv/paas/skills/
+  register: skills_list
+  changed_when: false
+  failed_when: false
+
+- name: Display skills count
+  ansible.builtin.debug:
+    msg: "Skills available: {{ skills_list.stdout_lines | reject('search', 'gitkeep') | list | length }}"
+
+# =============================================================================
+# Verify Scripts
+# =============================================================================
+
+- name: Count available scripts
+  ansible.builtin.command: docker exec openclaw-cli ls /srv/paas/scripts/
+  register: scripts_list
+  changed_when: false
+  failed_when: false
+
+- name: Display scripts count
+  ansible.builtin.debug:
+    msg: "Scripts available: {{ scripts_list.stdout_lines | reject('search', 'gitkeep') | list | length }}"
+
+# =============================================================================
+# Verify Telegram (if configured)
+# =============================================================================
+
+- name: Check Telegram configuration
+  when: telegram_bot_token | length > 0
+  block:
+    - name: Test Telegram bot API
+      ansible.builtin.uri:
+        url: "https://api.telegram.org/bot{{ telegram_bot_token }}/getMe"
+        method: GET
+        status_code: [200]
+      register: telegram_check
+      failed_when: false
+
+    - name: Display Telegram status
+      ansible.builtin.debug:
+        msg: "{{ 'Telegram bot configured: @' ~ telegram_check.json.result.username if telegram_check.json.ok | default(false) else 'Telegram bot token invalid' }}"
+
+- name: Telegram not configured
+  ansible.builtin.debug:
+    msg: "Telegram not configured (optional)"
+  when: telegram_bot_token | length == 0
+
+- name: OpenClaw setup complete
+  ansible.builtin.debug:
+    msg: "OpenClaw gateway verified"

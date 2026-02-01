@@ -1,0 +1,5 @@
+---
+# LobeChat role defaults
+
+casdoor_url: "http://127.0.0.1:8000"
+lobe_url: "http://127.0.0.1:3210"

@@ -1,0 +1,79 @@
+---
+# =============================================================================
+# PaaS AI Stack - Ansible Variables Example
+# =============================================================================
+# Copy this to all.yml and fill in your values:
+#   cp all.yml.example all.yml
+#
+# Generate secrets: openssl rand -base64 32
+# Generate hex passwords: openssl rand -hex 24
+
+# -----------------------------------------------------------------------------
+# PATHS (usually don't need to change)
+# -----------------------------------------------------------------------------
+paas_root: "{{ playbook_dir | dirname }}"
+paas_data_dir: "{{ paas_root }}/data"
+paas_env_file: "{{ paas_root }}/.env"
+paas_scripts_dir: "{{ paas_root }}/scripts"
+paas_skills_dir: "{{ paas_root }}/skills"
+
+# -----------------------------------------------------------------------------
+# SYSTEM
+# -----------------------------------------------------------------------------
+timezone: "America/New_York"
+base_domain: ""  # REQUIRED: Your domain (e.g., example.com)
+
+# -----------------------------------------------------------------------------
+# ADMIN ACCOUNT (used for automated setup)
+# -----------------------------------------------------------------------------
+admin_email: ""      # REQUIRED: admin@your-domain.com
+admin_username: "admin"
+admin_password: ""   # REQUIRED: Strong password (min 12 chars)
+
+# -----------------------------------------------------------------------------
+# CLOUDFLARE
+# -----------------------------------------------------------------------------
+# Option 1: Provide tunnel token directly (get from Cloudflare Zero Trust dashboard)
+cloudflare_tunnel_token: ""
+
+# Option 2: Provide API credentials to auto-create tunnel
+# Create token at: https://dash.cloudflare.com/profile/api-tokens
+# Required permissions:
+#   - Account / Cloudflare Tunnel / Edit + Read
+#   - Account / Workers AI / Edit (for LobeChat embeddings)
+#   - Zone / DNS / Edit
+cloudflare_api_token: ""
+cloudflare_account_id: ""
+cloudflare_zone_id: ""
+
+# -----------------------------------------------------------------------------
+# AI API KEYS (at least one required for OpenClaw)
+# -----------------------------------------------------------------------------
+# Priority: Anthropic → OpenRouter → OpenAI → Gemini
+anthropic_api_key: ""      # https://console.anthropic.com/settings/keys
+openrouter_api_key: ""     # https://openrouter.ai/keys (recommended - 100+ models)
+openai_api_key: ""         # https://platform.openai.com/api-keys
+gemini_api_key: ""         # https://aistudio.google.com/apikey
+deepseek_api_key: ""       # https://platform.deepseek.com/api_keys
+perplexity_api_key: ""     # https://www.perplexity.ai/settings/api
+brave_api_key: ""          # https://brave.com/search/api/
+
+# -----------------------------------------------------------------------------
+# TELEGRAM (Required for Telegram channel)
+# -----------------------------------------------------------------------------
+# Create via @BotFather: /newbot
+telegram_bot_token: ""
+
+# -----------------------------------------------------------------------------
+# OPTIONAL API KEYS
+# -----------------------------------------------------------------------------
+firecrawl_api_key: ""      # https://firecrawl.dev/
+elevenlabs_api_key: ""     # https://elevenlabs.io/
+
+# -----------------------------------------------------------------------------
+# SAMPLE APP (optional - for CI/CD verification)
+# -----------------------------------------------------------------------------
+deploy_sample_app: false
+sample_app_name: "hello-world"
+sample_app_subdomain: "hello"
+sample_app_port: 80

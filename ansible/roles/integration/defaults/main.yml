@@ -1,0 +1,7 @@
+---
+# Integration role defaults
+
+gitea_url: "http://127.0.0.1:3000"
+coolify_url: "http://127.0.0.1:8080"
+n8n_url: "http://127.0.0.1:5678"
+openclaw_url: "http://127.0.0.1:18789"

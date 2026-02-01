@@ -1,0 +1,129 @@
+---
+# n8n role - Setup owner account
+
+- name: n8n setup
+  ansible.builtin.debug:
+    msg: "Setting up n8n owner account..."
+
+# =============================================================================
+# Wait for n8n
+# =============================================================================
+
+- name: Wait for n8n API
+  ansible.builtin.uri:
+    url: "{{ n8n_url }}/healthz"
+    method: GET
+    status_code: [200]
+  register: n8n_ready
+  until: n8n_ready.status == 200
+  retries: 12
+  delay: 5
+  failed_when: false
+
+# =============================================================================
+# Check/Create Owner
+# =============================================================================
+
+- name: Check if owner exists
+  ansible.builtin.command: >
+    docker exec postgres-n8n psql -U n8n -d n8n -t -c
+    "SELECT COUNT(*) FROM public.user WHERE password != '' AND password IS NOT NULL"
+  register: owner_check
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: owner_check.rc == 0
+  failed_when: false
+
+- name: Setup owner account via API
+  when: owner_check.stdout | trim == '0'
+  ansible.builtin.uri:
+    url: "{{ n8n_url }}/rest/owner/setup"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      email: "{{ admin_email }}"
+      firstName: "{{ admin_username }}"
+      lastName: "Admin"
+      password: "{{ admin_password }}"
+      agree: true
+    status_code: [200]
+  register: owner_setup
+  retries: 5
+  delay: 5
+  until: owner_setup.status == 200
+  failed_when: false
+
+- name: Display owner status
+  ansible.builtin.debug:
+    msg: "{{ 'Owner account created' if owner_setup.json.id is defined else ('Owner already exists' if owner_check.stdout | trim != '0' else 'Owner setup may have failed') }}"
+
+# =============================================================================
+# Generate API Key
+# =============================================================================
+
+- name: Get user ID
+  ansible.builtin.command: >
+    docker exec postgres-n8n psql -U n8n -d n8n -t -c
+    "SELECT id FROM public.user LIMIT 1"
+  register: user_id
+  changed_when: false
+  failed_when: false
+
+- name: Update user email and name
+  when: user_id.stdout | trim | length > 0
+  ansible.builtin.command: >
+    docker exec postgres-n8n psql -U n8n -d n8n -c
+    "UPDATE public.user SET email='{{ admin_email }}', \"firstName\"='{{ admin_username }}' WHERE id='{{ user_id.stdout | trim }}'"
+  changed_when: true
+  failed_when: false
+
+- name: Check for existing API key
+  ansible.builtin.command: >
+    docker exec postgres-n8n psql -U n8n -d n8n -t -c
+    "SELECT \"apiKey\" FROM user_api_keys WHERE label='paas-bootstrap' LIMIT 1"
+  register: existing_key
+  changed_when: false
+  failed_when: false
+
+- name: Generate API key
+  when: existing_key.stdout | trim | length == 0 and user_id.stdout | trim | length > 0
+  block:
+    - name: Generate key values
+      ansible.builtin.set_fact:
+        api_key_id: "{{ lookup('community.general.random_string', length=36, special=false) | lower }}"
+        n8n_api_key: "n8n_api_{{ lookup('community.general.random_string', length=40, special=false) }}"
+
+    - name: Insert API key
+      ansible.builtin.command: >
+        docker exec postgres-n8n psql -U n8n -d n8n -c
+        "INSERT INTO user_api_keys (id, \"userId\", label, \"apiKey\", audience, \"createdAt\", \"updatedAt\")
+         VALUES ('{{ api_key_id }}', '{{ user_id.stdout | trim }}', 'paas-bootstrap', '{{ n8n_api_key }}', 'public-api', NOW(), NOW())"
+      register: key_insert
+      changed_when: key_insert.rc == 0
+
+    - name: Set n8n token
+      ansible.builtin.set_fact:
+        n8n_token: "{{ n8n_api_key }}"
+
+- name: Use existing key
+  ansible.builtin.set_fact:
+    n8n_token: "{{ existing_key.stdout | trim }}"
+  when: existing_key.stdout | trim | length > 0
+
+# =============================================================================
+# Update .env
+# =============================================================================
+
+- name: Update .env with n8n token
+  ansible.builtin.lineinfile:
+    path: "{{ paas_env_file }}"
+    regexp: "^N8N_TOKEN="
+    line: "N8N_TOKEN={{ n8n_token }}"
+  when: n8n_token | default('') | length > 0
+
+- name: n8n setup complete
+  ansible.builtin.debug:
+    msg: "n8n owner account configured"

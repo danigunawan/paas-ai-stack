@@ -1,0 +1,12 @@
+---
+# Sample app role defaults
+
+# Whether to deploy sample app (set to true to enable)
+deploy_sample_app: false
+
+sample_app_name: "hello-world"
+sample_app_subdomain: "hello"
+sample_app_port: 80
+
+# Local API URLs
+gitea_url: "http://127.0.0.1:3000"

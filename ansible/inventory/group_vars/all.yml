@@ -1,0 +1,202 @@
+---
+# =============================================================================
+# PaaS AI Stack - Ansible Variables
+# =============================================================================
+# Copy this to your inventory or override in host_vars as needed
+#
+# Generate secrets: openssl rand -base64 32
+# Generate hex passwords: openssl rand -hex 24
+
+# -----------------------------------------------------------------------------
+# PATHS
+# -----------------------------------------------------------------------------
+paas_root: "{{ playbook_dir | dirname }}"
+paas_data_dir: "{{ paas_root }}/data"
+paas_env_file: "{{ paas_root }}/.env"
+paas_scripts_dir: "{{ paas_root }}/scripts"
+paas_skills_dir: "{{ paas_root }}/skills"
+
+# -----------------------------------------------------------------------------
+# SYSTEM
+# -----------------------------------------------------------------------------
+timezone: "America/New_York"
+base_domain: ""  # REQUIRED: Your domain (e.g., example.com)
+
+# -----------------------------------------------------------------------------
+# ADMIN ACCOUNT (used for automated setup)
+# -----------------------------------------------------------------------------
+admin_email: ""      # REQUIRED: admin@your-domain.com
+admin_username: "admin"
+admin_password: ""   # REQUIRED: Strong password (min 12 chars)
+
+# -----------------------------------------------------------------------------
+# CLOUDFLARE
+# -----------------------------------------------------------------------------
+# Tunnel Token: Get from Cloudflare Zero Trust → Networks → Tunnels → Your Tunnel → Install connector
+#   The token is shown in the docker run command (after "run cloudflared tunnel --token")
+cloudflare_tunnel_token: ""
+
+# API Token: Create at https://dash.cloudflare.com/profile/api-tokens
+#   Click "Create Token" → "Create Custom Token"
+#   Required Permissions:
+#     - Account / Cloudflare Tunnel / Edit (to create/manage tunnels)
+#     - Account / Cloudflare Tunnel / Read (to list/verify tunnels)
+#     - Account / Workers AI / Edit (for LobeChat RAG embeddings)
+#     - Zone / DNS / Edit (to create DNS records for tunnel routes)
+#   Account Resources: Include → Your account
+#   Zone Resources: Include → Specific zone → Your domain
+cloudflare_api_token: ""
+
+# Account ID: Found in Cloudflare Dashboard → Any site → Overview (right sidebar)
+#   Or: Zero Trust Dashboard URL contains it: https://one.dash.cloudflare.com/<ACCOUNT_ID>/
+cloudflare_account_id: ""
+
+# Zone ID: Found in Cloudflare Dashboard → Your site → Overview (right sidebar, under "API")
+#   Required for DNS record creation
+cloudflare_zone_id: ""
+
+# -----------------------------------------------------------------------------
+# SERVICE DOMAINS (auto-generated from base_domain if not set)
+# -----------------------------------------------------------------------------
+gitea_domain: "{{ 'gitea.' ~ base_domain if base_domain else '' }}"
+coolify_domain: "{{ 'coolify.' ~ base_domain if base_domain else '' }}"
+coolify_realtime_domain: "{{ 'realtime.' ~ base_domain if base_domain else '' }}"
+n8n_domain: "{{ 'n8n.' ~ base_domain if base_domain else '' }}"
+lobe_domain: "{{ 'lobe.' ~ base_domain if base_domain else '' }}"
+casdoor_domain: "{{ 'lobe-auth.' ~ base_domain if base_domain else '' }}"
+minio_domain: "{{ 'lobe-minio.' ~ base_domain if base_domain else '' }}"
+openclaw_domain: "{{ 'claw.' ~ base_domain if base_domain else '' }}"
+
+# -----------------------------------------------------------------------------
+# AI API KEYS (at least one required for OpenClaw)
+# -----------------------------------------------------------------------------
+# Priority order for auto-onboarding:
+#   1. ANTHROPIC_API_KEY (default/recommended)
+#   2. OPENROUTER_API_KEY (100+ models with one key - great default choice)
+#   3. OPENAI_API_KEY
+#   4. GEMINI_API_KEY
+#
+# Where to get keys:
+#   Anthropic:   https://console.anthropic.com/settings/keys
+#   OpenRouter:  https://openrouter.ai/keys (recommended - access Claude, GPT, Gemini, etc.)
+#   OpenAI:      https://platform.openai.com/api-keys
+#   Google:      https://aistudio.google.com/apikey
+#   DeepSeek:    https://platform.deepseek.com/api_keys
+#   Perplexity:  https://www.perplexity.ai/settings/api
+#   Brave:       https://brave.com/search/api/
+anthropic_api_key: ""
+openrouter_api_key: ""
+openai_api_key: ""
+gemini_api_key: ""
+deepseek_api_key: ""
+perplexity_api_key: ""
+brave_api_key: ""
+
+# -----------------------------------------------------------------------------
+# TELEGRAM (Required for Telegram channel)
+# -----------------------------------------------------------------------------
+# Create a bot via @BotFather on Telegram:
+#   1. Message @BotFather with /newbot
+#   2. Follow prompts to name your bot
+#   3. Copy the token (format: 123456789:ABCdefGHI...)
+#
+# Without this token, OpenClaw cannot create/manage Telegram channels.
+telegram_bot_token: ""
+
+# -----------------------------------------------------------------------------
+# OPTIONAL API KEYS (Enhanced Features)
+# -----------------------------------------------------------------------------
+# These keys enable additional OpenClaw features:
+#
+# BRAVE_API_KEY - Web search capability
+#   Get key: https://brave.com/search/api/
+#   Required for: tools.web.search (agent can search the web)
+#
+# FIRECRAWL_API_KEY - Enhanced web fetch
+#   Get key: https://firecrawl.dev/
+#   Required for: Better web page content extraction
+#
+# ELEVENLABS_API_KEY - Text-to-speech
+#   Get key: https://elevenlabs.io/
+#   Required for: Voice responses, TTS in Telegram/Discord
+firecrawl_api_key: ""
+elevenlabs_api_key: ""
+
+# -----------------------------------------------------------------------------
+# AUTO-GENERATED SECRETS (populated by secrets role)
+# Leave empty - will be generated if not set
+# -----------------------------------------------------------------------------
+
+# Gitea PostgreSQL
+postgres_git_password: ""
+postgres_git_user: "gitea"
+postgres_git_db: "gitea"
+
+# n8n PostgreSQL
+postgres_n8n_password: ""
+postgres_n8n_user: "n8n"
+postgres_n8n_db: "n8n"
+
+# Coolify PostgreSQL
+postgres_coolify_password: ""
+
+# LobeChat PostgreSQL
+lobe_postgres_password: ""
+lobe_db_name: "lobechat"
+
+# MinIO (LobeChat object storage)
+minio_root_user: "lobe_admin"
+minio_root_password: ""
+minio_lobe_bucket: "lobechat"
+
+# Application secrets
+coolify_app_key: ""
+key_vaults_secret: ""
+next_auth_secret: ""
+jwks_key: ""
+
+# OpenClaw
+openclaw_gateway_token: ""
+# Version to build from source (tag, branch, or commit hash)
+# Use 'main' for latest, or pin to release tag e.g., 'v2026.1.30'
+openclaw_version: "main"
+
+# Service API tokens (generated during setup)
+gitea_token: ""
+gitea_actions_token: ""
+coolify_token: ""
+n8n_token: ""
+casdoor_client_id: ""
+casdoor_client_secret: ""
+gitea_oauth_client_id: ""
+gitea_oauth_client_secret: ""
+
+# Security settings (bootstrap sets these to true after initial setup)
+gitea_disable_registration: "false"
+gitea_require_signin: "false"
+
+# -----------------------------------------------------------------------------
+# DOCKER COMPOSE SETTINGS
+# -----------------------------------------------------------------------------
+compose_project_name: "paas-ai-stack"
+# Auto-detected: Windows uses "-f docker-compose.yml -f docker-compose.windows.yml"
+compose_files: ""
+
+# -----------------------------------------------------------------------------
+# OPTIONAL: SAMPLE APP DEPLOYMENT
+# -----------------------------------------------------------------------------
+# Set to true to deploy a hello-world app for CI/CD verification
+deploy_sample_app: false
+sample_app_name: "hello-world"
+sample_app_subdomain: "hello"
+sample_app_port: 80
+
+# -----------------------------------------------------------------------------
+# LOCAL API URLS (for health checks and setup)
+# -----------------------------------------------------------------------------
+gitea_url: "http://127.0.0.1:3000"
+coolify_url: "http://127.0.0.1:8080"
+n8n_url: "http://127.0.0.1:5678"
+casdoor_url: "http://127.0.0.1:8000"
+lobe_url: "http://127.0.0.1:3210"
+openclaw_url: "http://127.0.0.1:18789"
